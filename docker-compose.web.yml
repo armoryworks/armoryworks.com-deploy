@@ -1,0 +1,32 @@
+# Production compose for armoryworks-web (KAMRUI).
+# Runs the Angular UI only — the .NET API + DB live on armoryworks-api.
+#
+# Image source: GHCR (ghcr.io/armoryworks/armory-works-ui). Images are built
+# + pushed by the .github/workflows/release-ui.yml workflow in the
+# armoryworks/armoryworks.com source repo. The aw-deploy CLI pins
+# UI_IMAGE_TAG in .env on every deploy.
+#
+# Bring up with:
+#   aw-deploy <tag>              # operator-driven deploy + healthcheck rollback
+#   docker compose -f docker-compose.web.yml up -d    # straight compose (rarely)
+#
+# Host nginx on this box terminates TLS with the Cloudflare Origin Cert
+# and routes:
+#   /                      → http://127.0.0.1:4203 (this UI container)
+#   /api/*                 → http://192.168.1.198:8203 (.NET API on api box)
+#   /signin-oidc           → http://192.168.1.198:8203 (OIDC callback)
+#   /signout-callback-oidc → http://192.168.1.198:8203
+
+name: armory-works-web
+
+services:
+
+  armory-works-ui:
+    image: ghcr.io/armoryworks/armory-works-ui:${UI_IMAGE_TAG:-latest}
+    container_name: armory-works-ui
+    restart: unless-stopped
+    labels:
+      armoryworks.deploy-mode: "prod"
+    ports:
+      # 127.0.0.1 only — never public. Host nginx is the front door.
+      - "127.0.0.1:${UI_PORT:-4203}:8080"

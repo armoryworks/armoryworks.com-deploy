@@ -1,0 +1,19 @@
+# Operator-provided env files. NEVER commit these — they contain DB passwords,
+# SMTP creds, OIDC client secrets, etc.
+.env
+.env.local
+
+# OS cruft
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Editor
+*.swp
+*.swo
+*~
+.vscode/
+.idea/
+
+# Backup files left by setup scripts
+*.bak
