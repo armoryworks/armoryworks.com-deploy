@@ -1,0 +1,59 @@
+# /etc/cloudflared/config.yml — armoryworks-prod tunnel ingress.
+#
+# Public traffic hits Cloudflare's edge, terminates there, then Cloudflare
+# forwards through the outbound-initiated tunnel to this host. Where the
+# request goes from here is determined by `service:` below.
+#
+# Two stacks share this tunnel:
+#   armoryworks.com    — marketing site (UI container on this web box,
+#                        API cross-LAN to armoryworks-api:8203)
+#   forge.armoryworks.com / forge-demo / forge-test  — Forge product, demo,
+#                        test SPA (cross-LAN to armoryworks-api:4200/4203/4300
+#                        + forge-api on 5000). One-level subdomain naming
+#                        because Cloudflare's free-plan Universal SSL only
+#                        covers *.armoryworks.com — deeper wildcards would
+#                        need Advanced Certificate Manager.
+#
+# All entries terminate at host nginx on 127.0.0.1:443 with TLS host
+# armoryworks.com (the Origin Cert covers *.armoryworks.com and
+# *.forge.armoryworks.com via its SAN list — the second wildcard is
+# vestigial for now but kept in case we ever upgrade to ACM). nginx
+# then routes by HTTP Host header to the right vhost.
+#
+# qb-engineer.com is NOT in this ingress — that zone uses Cloudflare
+# edge Redirect Rules to 301 to forge.armoryworks.com. No origin
+# involvement.
+
+tunnel: e5a5fea7-a8d3-48db-af39-9c2ca27f06e6
+credentials-file: /etc/cloudflared/e5a5fea7-a8d3-48db-af39-9c2ca27f06e6.json
+
+ingress:
+  # ---- armoryworks.com (marketing site) -------------------------------------
+  - hostname: armoryworks.com
+    service: https://127.0.0.1:443
+    originRequest:
+      originServerName: armoryworks.com
+
+  - hostname: www.armoryworks.com
+    service: https://127.0.0.1:443
+    originRequest:
+      originServerName: armoryworks.com
+
+  # ---- Forge stack ----------------------------------------------------------
+  - hostname: forge.armoryworks.com
+    service: https://127.0.0.1:443
+    originRequest:
+      originServerName: armoryworks.com
+
+  - hostname: forge-demo.armoryworks.com
+    service: https://127.0.0.1:443
+    originRequest:
+      originServerName: armoryworks.com
+
+  - hostname: forge-test.armoryworks.com
+    service: https://127.0.0.1:443
+    originRequest:
+      originServerName: armoryworks.com
+
+  # ---- Catch-all (anything else returns 404 from cloudflared itself) --------
+  - service: http_status:404
