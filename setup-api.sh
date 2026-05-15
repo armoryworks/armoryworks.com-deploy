@@ -12,9 +12,10 @@
 #   6. Brings up the server container
 #   7. Waits for healthy
 #
-# Migrations are a SEPARATE MANUAL STEP — the deploy repo doesn't carry
-# source code. See "Initial DB migration" in the final notes printed at
-# the end of this script.
+# Migrations run automatically: the api image ships a self-contained
+# `dotnet ef migrations bundle` executable at /app/efbundle, generated
+# at image-build time. setup-api.sh runs it between the db-up and
+# server-up steps. aw-deploy does the same on every subsequent deploy.
 #
 # Run from /opt/armoryworks-deploy:
 #   ./setup-api.sh
@@ -213,7 +214,50 @@ fi
 ok "Database is healthy"
 
 # ─────────────────────────────────────────────────────────────
-# 7. Start server
+# 7. EF migrations
+# ─────────────────────────────────────────────────────────────
+#
+# The api image carries a self-contained migrations bundle at /app/efbundle
+# built into the image via `dotnet ef migrations bundle --self-contained`.
+# Run it now against the running DB before starting the server, so the
+# schema is in place when the API container boots.
+
+step "Applying EF migrations"
+
+PG_DB=$(get_env POSTGRES_DB)
+PG_USER=$(get_env POSTGRES_USER)
+PG_PASS=$(get_env POSTGRES_PASSWORD)
+PG_DB=${PG_DB:-armory_works_db}
+PG_USER=${PG_USER:-postgres}
+
+if [[ -z "$PG_PASS" ]]; then
+    fail "POSTGRES_PASSWORD not set in .env — cannot run migrations"
+    exit 1
+fi
+
+NETWORK=$(docker network ls --format '{{.Name}}' | grep -E '^armory-works-api_' | head -1)
+if [[ -z "$NETWORK" ]]; then
+    fail "Compose network armory-works-api_* not found — is armory-works-db up?"
+    exit 1
+fi
+
+DB_CONN="Host=armory-works-db;Port=5432;Database=${PG_DB};Username=${PG_USER};Password=${PG_PASS}"
+CURRENT_TAG=$(get_env SERVER_IMAGE_TAG)
+CURRENT_TAG=${CURRENT_TAG:-latest}
+SERVER_IMAGE="ghcr.io/armoryworks/armory-works-server:${CURRENT_TAG}"
+
+if ! docker run --rm \
+        --network "$NETWORK" \
+        --entrypoint /app/efbundle \
+        "$SERVER_IMAGE" \
+        --connection "$DB_CONN"; then
+    fail "EF migration failed — server NOT started. Fix the migration and re-run setup-api.sh."
+    exit 1
+fi
+ok "Migrations applied"
+
+# ─────────────────────────────────────────────────────────────
+# 8. Start server
 # ─────────────────────────────────────────────────────────────
 
 step "Starting API server"
@@ -240,8 +284,7 @@ if $HEALTHY; then
     ok "API is healthy"
 else
     warn "API health check timed out after ${MAX_WAIT}s"
-    warn "Most common cause on first run: DB schema doesn't match — run migrations."
-    warn "See 'Initial DB migration' below."
+    warn "Check: docker compose -f docker-compose.api.yml logs -f armory-works-server"
 fi
 
 # ─────────────────────────────────────────────────────────────
@@ -269,32 +312,6 @@ echo "  ─── Reminders ───"
 echo "  - UFW allow API LAN-only:"
 echo "      sudo ufw allow from 192.168.1.0/24 to any port ${API_PORT} proto tcp comment 'API LAN only'"
 echo "  - Fill SMTP credentials + OIDC_CLIENT_SECRET in .env before cutover."
-echo ""
-echo "  ─── Initial DB migration (one-time manual step) ───"
-echo "  The deploy repo doesn't carry source code, so EF migrations need to"
-echo "  run from a temporary source checkout. From your dev box:"
-echo ""
-echo "    # Copy the server source up to this box (one-time):"
-echo "    scp -r E:\\dev\\armory-works\\armory-works-server \\"
-echo "       ${USER}@${HOST_IP:-<api-ip>}:/tmp/aw-migration-source"
-echo ""
-echo "  Then SSH in and run:"
-echo "    cd /tmp/aw-migration-source"
-echo "    NETWORK=\$(docker network ls --format '{{.Name}}' | grep -E '^armory-works-api_' | head -1)"
-echo "    DB_CONN=\"Host=armory-works-db;Port=5432;Database=$(get_env POSTGRES_DB);Username=$(get_env POSTGRES_USER);Password=$(get_env POSTGRES_PASSWORD)\""
-echo "    docker run --rm --network \"\$NETWORK\" \\"
-echo "      -v \$(pwd):/src -v armory-works-ef-cache:/root -w /src \\"
-echo "      -e \"ARMORY_WORKS_DB=\$DB_CONN\" \\"
-echo "      mcr.microsoft.com/dotnet/sdk:9.0-alpine \\"
-echo "      sh -c 'dotnet tool install --global dotnet-ef >/dev/null && \\"
-echo "             export PATH=\$PATH:/root/.dotnet/tools && \\"
-echo "             dotnet restore src/ArmoryWorks.Api/ArmoryWorks.Api.csproj && \\"
-echo "             dotnet ef database update --project src/ArmoryWorks.Data --startup-project src/ArmoryWorks.Api'"
-echo "    rm -rf /tmp/aw-migration-source"
-echo ""
-echo "  Then restart the server:"
-echo "    docker compose -f docker-compose.api.yml restart armory-works-server"
-echo ""
-echo "  Future schema changes: same dance. We'll bundle migrations into the"
-echo "  image in a future release so this becomes 'aw-deploy --migrate'."
+echo "  - Migrations run automatically on every aw-deploy via the bundled"
+echo "    /app/efbundle in the api image. Schema changes are zero-touch."
 echo ""

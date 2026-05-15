@@ -540,6 +540,58 @@ deploy_service() {
   fi
   ok "Image pulled"
 
+  # ─── EF migrations (api service only) ───────────────────────────────
+  # The api image carries a self-contained migrations bundle at
+  # /app/efbundle, generated at image-build time via
+  # `dotnet ef migrations bundle --self-contained`. Run it against the
+  # running DB BEFORE we recreate the server container, so a bad
+  # migration aborts the deploy instead of crashlooping the new
+  # container after rollout. EF migrations are idempotent — re-running
+  # is a near-instant no-op when nothing's pending.
+  if [[ "$svc_id" == "api" ]]; then
+    step "Applying EF migrations"
+
+    local pg_db pg_user pg_pass network db_conn image
+    pg_db=$(env_get POSTGRES_DB)
+    pg_user=$(env_get POSTGRES_USER)
+    pg_pass=$(env_get POSTGRES_PASSWORD)
+    pg_db=${pg_db:-armory_works_db}
+    pg_user=${pg_user:-postgres}
+
+    if [[ -z "$pg_pass" ]]; then
+      err "POSTGRES_PASSWORD not set in .env — cannot run migrations"
+      env_set "$envvar" "$prior_tag"
+      log_event "$svc_id" "$prior_tag" "$target_tag" "missing-db-password"
+      return 1
+    fi
+
+    network=$(docker network ls --format '{{.Name}}' | grep -E '^armory-works-api_' | head -1)
+    if [[ -z "$network" ]]; then
+      err "Compose network armory-works-api_* not found — is armory-works-db up?"
+      env_set "$envvar" "$prior_tag"
+      log_event "$svc_id" "$prior_tag" "$target_tag" "no-network"
+      return 1
+    fi
+
+    db_conn="Host=armory-works-db;Port=5432;Database=${pg_db};Username=${pg_user};Password=${pg_pass}"
+    image="ghcr.io/${REGISTRY_OWNER}/armory-works-server:${target_tag}"
+
+    # docker run (not `compose run`) keeps this independent of compose's
+    # depends_on/profile semantics. The --network attachment is what
+    # lets the bundle reach the armory-works-db container by name.
+    if ! docker run --rm \
+        --network "$network" \
+        --entrypoint /app/efbundle \
+        "$image" \
+        --connection "$db_conn"; then
+      err "EF migration failed — aborting deploy, rolling .env back to $prior_tag"
+      env_set "$envvar" "$prior_tag"
+      log_event "$svc_id" "$prior_tag" "$target_tag" "migration-failed"
+      return 1
+    fi
+    ok "Migrations applied"
+  fi
+
   if ! $cmd up -d --force-recreate "$compose_name"; then
     err "docker compose up -d failed"
     env_set "$envvar" "$prior_tag"
