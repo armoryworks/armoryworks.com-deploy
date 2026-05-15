@@ -55,5 +55,11 @@ ingress:
     originRequest:
       originServerName: armoryworks.com
 
+  # ---- Ops surfaces ---------------------------------------------------------
+  - hostname: logs.armoryworks.com
+    service: https://127.0.0.1:443
+    originRequest:
+      originServerName: armoryworks.com
+
   # ---- Catch-all (anything else returns 404 from cloudflared itself) --------
   - service: http_status:404
