@@ -44,6 +44,14 @@ readonly HEALTHCHECK_POLL_INTERVAL=3
 readonly GHCR_USER_FILE="${STATE_DIR}/ghcr-user"
 readonly GHCR_TOKEN_FILE="${STATE_DIR}/ghcr-token"
 
+# Host role marker. Written by install-aw-deploy.sh:
+#   api  → this host runs db + server (Minisforum)
+#   web  → this host runs ui (KAMRUI)
+#   all  → single-host deployment (rare, dev only)
+# Without this file, aw-deploy falls back to "all detectable services" which
+# is fine for local single-host dev but wrong for split production.
+readonly ROLE_FILE="${STATE_DIR}/role"
+
 # Service descriptors: service_id|compose_service|image_repo|env_var|healthcheck_kind|compose_file
 # healthcheck_kind: docker (container healthcheck) or http:<path> (curl from host)
 readonly SERVICES=(
@@ -152,13 +160,29 @@ service_compose_path() {
 }
 
 detected_service_ids() {
+  # If the operator declared a role via install-aw-deploy.sh, honour it.
+  # The deploy repo carries BOTH compose files (because it serves both
+  # host types) so the compose-file-presence heuristic alone treats every
+  # box as both api+web. The role marker is the authoritative answer.
+  local role=""
+  if [[ -r "$ROLE_FILE" ]]; then
+    role=$(tr -d '\n\r' < "$ROLE_FILE")
+  fi
+
   local entry id kind
   for entry in "${SERVICES[@]}"; do
     id="${entry%%|*}"
     kind=$(service_field "$id" 6)
-    case "$kind" in
-      api) [[ -f "$COMPOSE_API" ]] && printf '%s\n' "$id" ;;
-      web) [[ -f "$COMPOSE_WEB" ]] && printf '%s\n' "$id" ;;
+    case "$role" in
+      api) [[ "$kind" == "api" ]] && [[ -f "$COMPOSE_API" ]] && printf '%s\n' "$id" ;;
+      web) [[ "$kind" == "web" ]] && [[ -f "$COMPOSE_WEB" ]] && printf '%s\n' "$id" ;;
+      all|"")
+        # No role file (legacy/dev) → fall back to "any compose file present"
+        case "$kind" in
+          api) [[ -f "$COMPOSE_API" ]] && printf '%s\n' "$id" ;;
+          web) [[ -f "$COMPOSE_WEB" ]] && printf '%s\n' "$id" ;;
+        esac
+        ;;
     esac
   done
 }
