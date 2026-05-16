@@ -94,25 +94,26 @@ usage() {
 aw-deploy ${AW_DEPLOY_VERSION} — armoryworks.com deploy CLI
 
 USAGE:
-  aw-deploy                        Interactive: list last 5 main-<sha> builds, prompt
-  aw-deploy <tag>                  Deploy a specific tag to all local services
+  aw-deploy                        Interactive: list last 5 versions, prompt
+  aw-deploy <tag>                  Deploy a specific tag (semver X.Y.Z or main-<sha>)
   aw-deploy --service <name>       Narrow to one service (api | ui | all)
-  aw-deploy --list                 List recent main-<sha> tags in GHCR
-  aw-deploy --list --releases      List <X.Y.Z> semver tags in GHCR
-  aw-deploy --status               Show currently deployed SHA + container health
-  aw-deploy --rollback             Re-pin to the previously deployed tag
+  aw-deploy --list                 List recent X.Y.Z versions in GHCR (default)
+  aw-deploy --list --builds        List recent main-<sha> tags instead
+  aw-deploy --status               Show currently deployed version + container health
+  aw-deploy --rollback             Re-pin to the previously deployed version
   aw-deploy --logs                 Tail the deploy history log
   aw-deploy --self-update          git pull this repo + reinstall the CLI
   aw-deploy --help                 This usage
 
 EXAMPLES:
-  aw-deploy main-abc1234                  Deploy that SHA to all local services
-  aw-deploy main-abc1234 --service api    Deploy that SHA only to api
-  aw-deploy --service ui                  Pick a tag interactively for ui only
-  aw-deploy 1.2.3                         Deploy a semver release
+  aw-deploy 0.1.7                         Deploy that version to all local services
+  aw-deploy 0.1.7 --service api           Deploy that version only to api
+  aw-deploy --service ui                  Pick a version interactively for ui only
+  aw-deploy main-abc1234                  Deploy a specific build SHA (rare)
 
 NOTES:
   * Service set is auto-detected by which compose file is present.
+  * Both X.Y.Z versions and main-<sha> tags are accepted.
   * Refuses to deploy 'latest' — only immutable tags are accepted.
   * State: ${STATE_FILE}
   * Log:   ${LOG_FILE}
@@ -397,7 +398,8 @@ wait_healthy() {
 # ─────────────────────────────────────────────────────────────
 
 cmd_list() {
-  local mode="${1:-builds}"
+  # mode = versions (default, semver X.Y.Z tags) or builds (main-<sha> tags)
+  local mode="${1:-versions}"
   local svc_id pattern
   printf '\n%sAvailable tags%s (mode=%s)\n\n' "${C_BOLD}" "${C_RESET}" "$mode"
   for svc_id in $(detected_service_ids); do
@@ -411,12 +413,17 @@ cmd_list() {
       continue
     fi
     case "$mode" in
+      versions) pattern='^[0-9]+\.[0-9]+\.[0-9]+$' ;;
       builds)   pattern='^main-[a-f0-9]+$' ;;
-      releases) pattern='^[0-9]+\.[0-9]+\.[0-9]+$' ;;
       *)        pattern='.' ;;
     esac
+    # sort -V for proper semver ordering (0.1.10 > 0.1.9, which alpha-sort gets wrong)
     local matched
-    matched=$(printf '%s\n' "$tags" | grep -E "$pattern" | sort -r | head -10)
+    if [[ "$mode" == "versions" ]]; then
+      matched=$(printf '%s\n' "$tags" | grep -E "$pattern" | sort -Vr | head -10)
+    else
+      matched=$(printf '%s\n' "$tags" | grep -E "$pattern" | sort -r | head -10)
+    fi
     if [[ -z "$matched" ]]; then
       printf '  %s(no tags matching %s)%s\n' "${C_DIM}" "$pattern" "${C_RESET}"
     else
@@ -481,11 +488,16 @@ pick_tag_interactive() {
   local repo
   repo=$(service_repo "$svc_id")
   local tags
-  tags=$(ghcr_list_tags "$repo" 2>/dev/null | grep -E '^main-[a-f0-9]+$' | sort -r | head -5 || true)
+  # Prefer semver versions (X.Y.Z). Fall back to main-<sha> if no versions exist yet
+  # (e.g. for an image that pre-dates the auto-version workflow).
+  tags=$(ghcr_list_tags "$repo" 2>/dev/null | grep -E '^[0-9]+\.[0-9]+\.[0-9]+$' | sort -Vr | head -5 || true)
   if [[ -z "$tags" ]]; then
-    die "No main-<sha> tags available for $repo"
+    tags=$(ghcr_list_tags "$repo" 2>/dev/null | grep -E '^main-[a-f0-9]+$' | sort -r | head -5 || true)
   fi
-  printf '\nRecent builds for %s:\n' "$repo" >&2
+  if [[ -z "$tags" ]]; then
+    die "No version or main-<sha> tags available for $repo"
+  fi
+  printf '\nRecent versions for %s:\n' "$repo" >&2
   local i=1
   local tag_array=()
   while IFS= read -r t; do
@@ -705,13 +717,15 @@ main() {
   fi
 
   local mode="" service_arg="" positional=""
-  local list_releases=false
+  # list_mode = "versions" (semver, default) | "builds" (main-<sha>)
+  local list_mode="versions"
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --help|-h)     usage; exit 0 ;;
       --version|-V)  printf 'aw-deploy %s\n' "$AW_DEPLOY_VERSION"; exit 0 ;;
       --list)        mode="list"; shift ;;
-      --releases)    list_releases=true; shift ;;
+      --releases)    list_mode="versions"; shift ;;  # legacy alias, semver default
+      --builds)      list_mode="builds";   shift ;;  # opt-in for main-<sha> tags
       --status)      mode="status"; shift ;;
       --rollback)    mode="rollback"; shift ;;
       --logs)        mode="logs"; shift ;;
@@ -730,7 +744,7 @@ main() {
   case "$mode" in
     list)
       preflight
-      if $list_releases; then cmd_list releases; else cmd_list builds; fi
+      cmd_list "$list_mode"
       ;;
     status)
       preflight
