@@ -29,4 +29,8 @@ services:
       armoryworks.deploy-mode: "prod"
     ports:
       # 127.0.0.1 only — never public. Host nginx is the front door.
-      - "127.0.0.1:${UI_PORT:-4203}:8080"
+      # Container side is 80: the static-site image runs stock nginx on :80
+      # (source repo nginx.conf / Dockerfile EXPOSE 80). The old Angular image
+      # listened on 8080 — that mismatch surfaced as a 502 behind host nginx
+      # even though the container's own healthcheck passed.
+      - "127.0.0.1:${UI_PORT:-4203}:80"
