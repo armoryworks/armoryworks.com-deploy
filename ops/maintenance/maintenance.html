@@ -1,0 +1,80 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <title>Armory Works — back shortly</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="robots" content="noindex">
+  <!-- Self-contained: no external CSS/fonts/JS. This page is served by host
+       nginx when the UI container is unreachable, so it must render with
+       nothing else available. -->
+  <style>
+    :root {
+      --bg: #0f172a; --surface: #1e293b; --border: #334155;
+      --text: #f1f5f9; --muted: #94a3b8; --teal: #2dd4bf; --amber: #f59e0b;
+    }
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    html, body {
+      height: 100%;
+      background: var(--bg);
+      color: var(--text);
+      font-family: system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+      -webkit-font-smoothing: antialiased;
+    }
+    body {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      padding: 24px;
+      background:
+        radial-gradient(ellipse at top left, rgba(13,148,136,0.12), transparent 60%),
+        radial-gradient(ellipse at bottom right, rgba(45,212,191,0.08), transparent 60%),
+        var(--bg);
+    }
+    .card {
+      max-width: 460px;
+      width: 100%;
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-left: 3px solid var(--teal);
+      padding: 36px 32px;
+    }
+    .eyebrow {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      font-family: ui-monospace, "SFMono-Regular", Consolas, Monaco, monospace;
+      font-size: 11px;
+      letter-spacing: 0.14em;
+      text-transform: uppercase;
+      color: var(--amber);
+      margin-bottom: 18px;
+    }
+    .dot {
+      width: 8px; height: 8px; border-radius: 50%;
+      background: var(--amber);
+    }
+    h1 { font-size: 26px; line-height: 1.2; letter-spacing: -0.01em; margin-bottom: 12px; }
+    p { color: var(--muted); font-size: 15px; line-height: 1.6; }
+    .firm {
+      margin-top: 28px;
+      font-family: ui-monospace, "SFMono-Regular", Consolas, Monaco, monospace;
+      font-size: 12px;
+      letter-spacing: 0.08em;
+      color: #64748b;
+    }
+  </style>
+</head>
+<body>
+  <main class="card">
+    <span class="eyebrow"><span class="dot"></span>Maintenance</span>
+    <h1>We&rsquo;ll be right back.</h1>
+    <p>
+      Armory Works is updating the site. This usually takes under a minute —
+      refresh shortly. If it persists, email
+      <a href="mailto:info@armoryworks.com" style="color: var(--teal);">info@armoryworks.com</a>.
+    </p>
+    <p class="firm">ARMORY WORKS</p>
+  </main>
+</body>
+</html>

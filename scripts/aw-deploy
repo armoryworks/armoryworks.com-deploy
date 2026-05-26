@@ -26,7 +26,7 @@ set -euo pipefail
 # Constants
 # ─────────────────────────────────────────────────────────────
 
-readonly AW_DEPLOY_VERSION="0.1.0"
+readonly AW_DEPLOY_VERSION="0.1.1"
 readonly REPO_ROOT="${AW_DEPLOY_REPO:-/opt/armoryworks-deploy}"
 readonly STATE_DIR="/etc/armoryworks"
 readonly STATE_FILE="${STATE_DIR}/deploy-state.json"
@@ -56,7 +56,7 @@ readonly ROLE_FILE="${STATE_DIR}/role"
 # healthcheck_kind: docker (container healthcheck) or http:<path> (curl from host)
 readonly SERVICES=(
   "api|armory-works-server|armory-works-server|SERVER_IMAGE_TAG|http:/api/health|api"
-  "ui|armory-works-ui|armory-works-ui|UI_IMAGE_TAG|docker|web"
+  "ui|armory-works-ui|armory-works-ui|UI_IMAGE_TAG|http:/|web"
 )
 
 # Tag format regexes
@@ -379,10 +379,17 @@ wait_healthy() {
         ;;
       http:*)
         local path="${health#http:}"
-        local api_port
-        api_port=$(env_get API_PORT || true)
-        api_port="${api_port:-8203}"
-        if curl -fsS --max-time 3 "http://127.0.0.1:${api_port}${path}" >/dev/null 2>&1; then
+        # Resolve the host-PUBLISHED port for THIS service and curl it, so the
+        # gate verifies what host nginx actually proxies to — not merely the
+        # container's internal healthcheck. A container can report "healthy"
+        # on its internal port while the published port maps to the wrong
+        # container port (the 8080-vs-80 mismatch that 502'd the live site).
+        local hp
+        case "$svc_id" in
+          ui)  hp=$(env_get UI_PORT  || true); hp="${hp:-4203}" ;;
+          *)   hp=$(env_get API_PORT || true); hp="${hp:-8203}" ;;
+        esac
+        if curl -fsS --max-time 3 "http://127.0.0.1:${hp}${path}" >/dev/null 2>&1; then
           return 0
         fi
         ;;

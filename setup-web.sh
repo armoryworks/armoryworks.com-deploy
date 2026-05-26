@@ -154,6 +154,20 @@ compose pull armory-works-ui
 ok "UI image pulled"
 
 # ─────────────────────────────────────────────────────────────
+# 4b. Maintenance page (host nginx serves it when the UI is down)
+# ─────────────────────────────────────────────────────────────
+
+step "Installing maintenance page"
+if [[ -f "ops/maintenance/maintenance.html" ]]; then
+    sudo install -D -m 0644 ops/maintenance/maintenance.html /var/www/armoryworks-maintenance/maintenance.html
+    ok "Installed /var/www/armoryworks-maintenance/maintenance.html"
+    info "Host nginx serves this as a 503 when the UI container is unreachable"
+    info "(error_page 502/503/504 in ops/nginx/armoryworks.com.conf)."
+else
+    warn "ops/maintenance/maintenance.html not found — skipping"
+fi
+
+# ─────────────────────────────────────────────────────────────
 # 5. Start UI
 # ─────────────────────────────────────────────────────────────
 
@@ -185,7 +199,8 @@ echo "  Deploy:  aw-deploy --list   (see available tags)"
 echo "           aw-deploy main-<sha>   (pin to an immutable tag)"
 echo ""
 echo "  ─── Host-level steps still required ───"
-echo "  - Install host nginx vhost:"
+echo "  - Install host nginx vhost (serves the maintenance page installed above"
+echo "    from /var/www/armoryworks-maintenance/ when the UI is unreachable):"
 echo "      sudo cp ops/nginx/armoryworks.com.conf /etc/nginx/sites-available/"
 echo "      sudo ln -s /etc/nginx/sites-available/armoryworks.com.conf /etc/nginx/sites-enabled/"
 echo "      sudo nginx -t && sudo systemctl reload nginx"
