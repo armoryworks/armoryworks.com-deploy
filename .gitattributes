@@ -1,0 +1,4 @@
+# Keep everything LF in the repo. CRLF on a *.sh / extensionless script breaks
+# the shebang interpreter line on Linux ("bad interpreter: ...^M"), which is
+# exactly the kind of thing aw-preflight checks for.
+* text=auto eol=lf

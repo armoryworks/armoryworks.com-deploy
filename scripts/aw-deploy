@@ -1,24 +1,19 @@
 #!/usr/bin/env bash
-# aw-deploy — Operator-driven deploy CLI for armoryworks.com infrastructure.
+# aw-deploy — Operator-driven deploy CLI for armoryworks.com.
 #
-# Ported from forge-deploy (e:/dev/forge/forge-deploy/scripts/forge-deploy)
-# with armoryworks-specific service descriptors and per-box service detection.
+# armoryworks.com is a single static site: one container (the nginx image
+# built from the source repo), one box. This CLI pulls the image from
+# ghcr.io/armoryworks/armory-works-ui, pins UI_IMAGE_TAG in .env, recreates
+# the container, and gates on a host-PUBLISHED-port health check with
+# rollback. State + log retained on the host.
 #
-# Pulls images from ghcr.io/armoryworks/armory-works-{server,ui}, pins the
-# operative .env to the chosen tag, and runs `docker compose up -d` with
-# healthcheck-gated rollback. State + log files retained on the host.
+# Conventions shared with forge-deploy (the reference) — see the source repo's
+# docs/deploy-conventions.md. armoryworks.com implements only the trivial
+# single-service slice: no topology wizard, no component scope, no DB /
+# migrations / profiles.
 #
-# Service set is auto-detected by which compose file is present in
-# /opt/armoryworks-deploy (or wherever AW_DEPLOY_REPO points):
-#   docker-compose.api.yml present → manages 'api' (armory-works-server)
-#   docker-compose.web.yml present → manages 'ui'  (armory-works-ui)
-#   Both present                   → manages both (single-host setup)
-#
-# Bash conventions:
-#   - set -euo pipefail
-#   - all variables quoted
-#   - [[ ]] over [ ]
-#   - never deploys 'latest'
+# Bash conventions: set -euo pipefail · quote everything · [[ ]] over [ ] ·
+# never deploys 'latest'.
 
 set -euo pipefail
 
@@ -26,45 +21,38 @@ set -euo pipefail
 # Constants
 # ─────────────────────────────────────────────────────────────
 
-readonly AW_DEPLOY_VERSION="0.1.1"
+readonly AW_DEPLOY_VERSION="0.2.0"
 readonly REPO_ROOT="${AW_DEPLOY_REPO:-/opt/armoryworks-deploy}"
 readonly STATE_DIR="/etc/armoryworks"
 readonly STATE_FILE="${STATE_DIR}/deploy-state.json"
 readonly LOG_FILE="/var/log/aw-deploy.log"
 readonly ENV_FILE="${REPO_ROOT}/.env"
-readonly COMPOSE_API="${REPO_ROOT}/docker-compose.api.yml"
 readonly COMPOSE_WEB="${REPO_ROOT}/docker-compose.web.yml"
 readonly REGISTRY_HOST="ghcr.io"
 readonly REGISTRY_OWNER="armoryworks"
-readonly HEALTHCHECK_TIMEOUT_SECS=90
+
+# The one service. armoryworks.com is a single static container.
+readonly IMAGE_REPO="armory-works-ui"
+readonly IMAGE_ENVVAR="UI_IMAGE_TAG"
+readonly COMPOSE_SERVICE="armory-works-ui"
+readonly HEALTH_PATH="/"          # static site root returns 200 when healthy
+
+# Max seconds to wait for the published port to answer before rolling back.
+# Override per host via .env (HEALTHCHECK_TIMEOUT_SECS=...) or a shell env var.
+readonly HEALTHCHECK_TIMEOUT_DEFAULT=120
 readonly HEALTHCHECK_POLL_INTERVAL=3
 
-# GHCR auth: PAT with read:packages scope. Required because the package is
-# private. install-aw-deploy.sh accepts the PAT and writes these files.
+# GHCR auth: PAT with read:packages scope (the package is private).
+# install-aw-deploy.sh writes these.
 readonly GHCR_USER_FILE="${STATE_DIR}/ghcr-user"
 readonly GHCR_TOKEN_FILE="${STATE_DIR}/ghcr-token"
-
-# Host role marker. Written by install-aw-deploy.sh:
-#   api  → this host runs db + server (Minisforum)
-#   web  → this host runs ui (KAMRUI)
-#   all  → single-host deployment (rare, dev only)
-# Without this file, aw-deploy falls back to "all detectable services" which
-# is fine for local single-host dev but wrong for split production.
-readonly ROLE_FILE="${STATE_DIR}/role"
-
-# Service descriptors: service_id|compose_service|image_repo|env_var|healthcheck_kind|compose_file
-# healthcheck_kind: docker (container healthcheck) or http:<path> (curl from host)
-readonly SERVICES=(
-  "api|armory-works-server|armory-works-server|SERVER_IMAGE_TAG|http:/api/health|api"
-  "ui|armory-works-ui|armory-works-ui|UI_IMAGE_TAG|http:/|web"
-)
 
 # Tag format regexes
 readonly TAG_RE_SHA='^main-[a-f0-9]{7,40}$'
 readonly TAG_RE_SEMVER='^[0-9]+\.[0-9]+\.[0-9]+$'
 
 # ─────────────────────────────────────────────────────────────
-# Color output
+# Color output (respects NO_COLOR)
 # ─────────────────────────────────────────────────────────────
 
 if [[ -n "${NO_COLOR:-}" ]] || [[ ! -t 1 ]]; then
@@ -94,102 +82,35 @@ usage() {
 aw-deploy ${AW_DEPLOY_VERSION} — armoryworks.com deploy CLI
 
 USAGE:
-  aw-deploy                        Interactive: list last 5 versions, prompt
-  aw-deploy <tag>                  Deploy a specific tag (semver X.Y.Z or main-<sha>)
-  aw-deploy --service <name>       Narrow to one service (api | ui | all)
-  aw-deploy --list                 List recent X.Y.Z versions in GHCR (default)
-  aw-deploy --list --builds        List recent main-<sha> tags instead
-  aw-deploy --status               Show currently deployed version + container health
-  aw-deploy --rollback             Re-pin to the previously deployed version
-  aw-deploy --logs                 Tail the deploy history log
-  aw-deploy --self-update          git pull this repo + reinstall the CLI
-  aw-deploy --help                 This usage
+  aw-deploy                  Interactive: pick a recent version, deploy it
+  aw-deploy <tag>            Deploy a specific tag (semver X.Y.Z or main-<sha>)
+  aw-deploy --up             Bring the container up on the currently pinned tag
+  aw-deploy compose <args>   Scope-aware 'docker compose' passthrough (use this,
+                             not bare docker compose)
+  aw-deploy --list           List recent X.Y.Z versions in GHCR
+  aw-deploy --list --builds  List recent main-<sha> build tags instead
+  aw-deploy --status         Show deployed version + container health
+  aw-deploy --rollback       Re-pin to the previously deployed version
+  aw-deploy --logs           Tail the deploy history log
+  aw-deploy --self-update    git pull this repo + reinstall the CLI
+  aw-deploy --help           This usage
 
 EXAMPLES:
-  aw-deploy 0.1.7                         Deploy that version to all local services
-  aw-deploy 0.1.7 --service api           Deploy that version only to api
-  aw-deploy --service ui                  Pick a version interactively for ui only
-  aw-deploy main-abc1234                  Deploy a specific build SHA (rare)
+  aw-deploy 0.1.11           Deploy that version
+  aw-deploy main-c3f04bc     Deploy a specific build SHA
+  aw-deploy --up             Recreate on the pinned tag (e.g. after a compose edit)
 
 NOTES:
-  * Service set is auto-detected by which compose file is present.
-  * Both X.Y.Z versions and main-<sha> tags are accepted.
-  * Refuses to deploy 'latest' — only immutable tags are accepted.
-  * State: ${STATE_FILE}
-  * Log:   ${LOG_FILE}
-  * Repo:  ${REPO_ROOT}
+  * Single static service (armory-works-ui). One container, one box.
+  * Both X.Y.Z versions and main-<sha> tags are accepted; 'latest' is refused.
+  * Health gate curls the host-published port (127.0.0.1:UI_PORT/), not just
+    the container's internal healthcheck.
+  * State: ${STATE_FILE}   Log: ${LOG_FILE}   Repo: ${REPO_ROOT}
 EOF
 }
 
 # ─────────────────────────────────────────────────────────────
-# Service descriptor helpers
-# ─────────────────────────────────────────────────────────────
-
-service_field() {
-  local id="$1" idx="$2" entry
-  for entry in "${SERVICES[@]}"; do
-    if [[ "${entry%%|*}" == "$id" ]]; then
-      IFS='|' read -r _f1 _f2 _f3 _f4 _f5 _f6 <<<"$entry"
-      case "$idx" in
-        1) printf '%s\n' "$_f1" ;;
-        2) printf '%s\n' "$_f2" ;;
-        3) printf '%s\n' "$_f3" ;;
-        4) printf '%s\n' "$_f4" ;;
-        5) printf '%s\n' "$_f5" ;;
-        6) printf '%s\n' "$_f6" ;;
-        *) return 1 ;;
-      esac
-      return 0
-    fi
-  done
-  return 1
-}
-
-service_compose_name() { service_field "$1" 2; }
-service_repo()         { service_field "$1" 3; }
-service_envvar()       { service_field "$1" 4; }
-service_health()       { service_field "$1" 5; }
-service_compose_file() { service_field "$1" 6; }
-
-service_compose_path() {
-  local kind
-  kind=$(service_compose_file "$1")
-  case "$kind" in
-    api) printf '%s\n' "$COMPOSE_API" ;;
-    web) printf '%s\n' "$COMPOSE_WEB" ;;
-  esac
-}
-
-detected_service_ids() {
-  # If the operator declared a role via install-aw-deploy.sh, honour it.
-  # The deploy repo carries BOTH compose files (because it serves both
-  # host types) so the compose-file-presence heuristic alone treats every
-  # box as both api+web. The role marker is the authoritative answer.
-  local role=""
-  if [[ -r "$ROLE_FILE" ]]; then
-    role=$(tr -d '\n\r' < "$ROLE_FILE")
-  fi
-
-  local entry id kind
-  for entry in "${SERVICES[@]}"; do
-    id="${entry%%|*}"
-    kind=$(service_field "$id" 6)
-    case "$role" in
-      api) [[ "$kind" == "api" ]] && [[ -f "$COMPOSE_API" ]] && printf '%s\n' "$id" ;;
-      web) [[ "$kind" == "web" ]] && [[ -f "$COMPOSE_WEB" ]] && printf '%s\n' "$id" ;;
-      all|"")
-        # No role file (legacy/dev) → fall back to "any compose file present"
-        case "$kind" in
-          api) [[ -f "$COMPOSE_API" ]] && printf '%s\n' "$id" ;;
-          web) [[ -f "$COMPOSE_WEB" ]] && printf '%s\n' "$id" ;;
-        esac
-        ;;
-    esac
-  done
-}
-
-# ─────────────────────────────────────────────────────────────
-# Pre-flight
+# Pre-flight (inline guards; see scripts/aw-preflight for the full doctor)
 # ─────────────────────────────────────────────────────────────
 
 require_cmd() {
@@ -202,21 +123,11 @@ preflight() {
   require_cmd jq
   docker compose version >/dev/null 2>&1 || die "docker compose plugin missing"
 
-  if [[ ! -f "$COMPOSE_API" ]] && [[ ! -f "$COMPOSE_WEB" ]]; then
-    die "No compose file at $COMPOSE_API or $COMPOSE_WEB (set AW_DEPLOY_REPO?)"
-  fi
-  if [[ ! -f "$ENV_FILE" ]]; then
-    die "Env file not found: $ENV_FILE (run setup-{api,web}.sh first)"
-  fi
-  if [[ ! -f "$STATE_FILE" ]]; then
-    die "State file not found: $STATE_FILE (run scripts/install-aw-deploy.sh)"
-  fi
-  if [[ ! -w "$STATE_FILE" ]]; then
-    die "State file not writable: $STATE_FILE"
-  fi
-  if [[ ! -w "$LOG_FILE" ]]; then
-    die "Log file not writable: $LOG_FILE"
-  fi
+  [[ -f "$COMPOSE_WEB" ]] || die "Compose file not found: $COMPOSE_WEB (set AW_DEPLOY_REPO?)"
+  [[ -f "$ENV_FILE" ]]    || die "Env file not found: $ENV_FILE (run setup-web.sh first)"
+  [[ -f "$STATE_FILE" ]]  || die "State file not found: $STATE_FILE (run scripts/install-aw-deploy.sh)"
+  [[ -w "$STATE_FILE" ]]  || die "State file not writable: $STATE_FILE"
+  [[ -w "$LOG_FILE" ]]    || die "Log file not writable: $LOG_FILE"
   if [[ ! -r "$GHCR_USER_FILE" || ! -r "$GHCR_TOKEN_FILE" ]]; then
     die "GHCR credentials missing at $GHCR_USER_FILE / $GHCR_TOKEN_FILE — run scripts/install-aw-deploy.sh"
   fi
@@ -237,7 +148,7 @@ validate_tag() {
 }
 
 # ─────────────────────────────────────────────────────────────
-# GHCR API (private images — Basic Auth with a PAT)
+# GHCR API (private image — Basic Auth with a PAT)
 # ─────────────────────────────────────────────────────────────
 
 ghcr_basic_creds() {
@@ -252,9 +163,7 @@ ghcr_basic_creds() {
 ghcr_token() {
   local repo="$1" creds
   creds=$(ghcr_basic_creds)
-  if [[ -z "$creds" ]]; then
-    die "GHCR credentials missing — run scripts/install-aw-deploy.sh"
-  fi
+  [[ -n "$creds" ]] || die "GHCR credentials missing — run scripts/install-aw-deploy.sh"
   curl -fsSL -u "$creds" \
     "https://${REGISTRY_HOST}/token?service=${REGISTRY_HOST}&scope=repository:${REGISTRY_OWNER}/${repo}:pull" \
     | jq -r '.token'
@@ -292,20 +201,20 @@ ghcr_tag_exists() {
 # ─────────────────────────────────────────────────────────────
 
 state_get() {
-  local repo="$1" field="${2:-}"
+  local field="${1:-}"
   if [[ -z "$field" ]]; then
-    jq -r --arg r "$repo" '.[$r] // {} | tojson' "$STATE_FILE"
+    jq -r --arg r "$IMAGE_REPO" '.[$r] // {} | tojson' "$STATE_FILE"
   else
-    jq -r --arg r "$repo" --arg f "$field" '.[$r][$f] // ""' "$STATE_FILE"
+    jq -r --arg r "$IMAGE_REPO" --arg f "$field" '.[$r][$f] // ""' "$STATE_FILE"
   fi
 }
 
 state_set() {
-  local repo="$1" new_tag="$2" now tmp prior_tag
+  local new_tag="$1" now tmp prior_tag
   now=$(date -u +'%Y-%m-%dT%H:%M:%SZ')
-  prior_tag=$(state_get "$repo" current)
+  prior_tag=$(state_get current)
   tmp=$(mktemp)
-  jq --arg r "$repo" --arg cur "$new_tag" --arg prior "$prior_tag" --arg ts "$now" \
+  jq --arg r "$IMAGE_REPO" --arg cur "$new_tag" --arg prior "$prior_tag" --arg ts "$now" \
     '.[$r] = {current: $cur, prior: $prior, deployedAt: $ts}' \
     "$STATE_FILE" > "$tmp"
   mv "$tmp" "$STATE_FILE"
@@ -335,65 +244,43 @@ env_set() {
   mv "$tmp" "$ENV_FILE"
 }
 
+# Effective health timeout: .env override > shell env > default. Validated to a
+# positive int so a typo can't make the wait loop exit immediately.
+health_timeout() {
+  local v
+  v=$(env_get HEALTHCHECK_TIMEOUT_SECS)
+  v="${v:-${HEALTHCHECK_TIMEOUT_SECS:-$HEALTHCHECK_TIMEOUT_DEFAULT}}"
+  [[ "$v" =~ ^[1-9][0-9]*$ ]] || v="$HEALTHCHECK_TIMEOUT_DEFAULT"
+  printf '%s' "$v"
+}
+
 log_event() {
-  local svc="$1" from="$2" to="$3" outcome="$4" ts
+  local from="$1" to="$2" outcome="$3" ts
   ts=$(date -u +'%Y-%m-%dT%H:%M:%SZ')
-  printf '%s %s %s -> %s %s\n' "$ts" "$svc" "${from:-<none>}" "$to" "$outcome" >> "$LOG_FILE"
+  printf '%s %s %s -> %s %s\n' "$ts" "$COMPOSE_SERVICE" "${from:-<none>}" "$to" "$outcome" >> "$LOG_FILE"
 }
 
 # ─────────────────────────────────────────────────────────────
 # Compose + health
 # ─────────────────────────────────────────────────────────────
 
-compose_for_service() {
-  local svc_id="$1" cf
-  cf=$(service_compose_path "$svc_id")
-  printf 'docker compose --env-file %s -f %s' "$ENV_FILE" "$cf"
+compose() {
+  docker compose --env-file "$ENV_FILE" -f "$COMPOSE_WEB" "$@"
 }
 
+# Wait for the host-PUBLISHED port to answer 200. This verifies what host nginx
+# actually proxies to — not merely the container's internal healthcheck. A
+# container can report "healthy" on its internal port while the published port
+# maps to the wrong container port (the 8080-vs-80 mismatch that 502'd the
+# live site). Returns 0 healthy, 1 timeout.
 wait_healthy() {
-  local svc_id="$1" compose_name health
-  compose_name=$(service_compose_name "$svc_id")
-  health=$(service_health "$svc_id")
-  local cmd
-  cmd=$(compose_for_service "$svc_id")
-  local elapsed=0
-
-  while (( elapsed < HEALTHCHECK_TIMEOUT_SECS )); do
-    case "$health" in
-      docker)
-        local cid status
-        cid=$($cmd ps -q "$compose_name" 2>/dev/null || true)
-        if [[ -n "$cid" ]]; then
-          status=$(docker inspect --format '{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' "$cid" 2>/dev/null || echo unknown)
-          if [[ "$status" == "healthy" ]]; then return 0; fi
-          if [[ "$status" == "none" ]]; then
-            local running
-            running=$(docker inspect --format '{{.State.Running}}' "$cid" 2>/dev/null || echo false)
-            if [[ "$running" == "true" ]]; then
-              sleep 5
-              return 0
-            fi
-          fi
-        fi
-        ;;
-      http:*)
-        local path="${health#http:}"
-        # Resolve the host-PUBLISHED port for THIS service and curl it, so the
-        # gate verifies what host nginx actually proxies to — not merely the
-        # container's internal healthcheck. A container can report "healthy"
-        # on its internal port while the published port maps to the wrong
-        # container port (the 8080-vs-80 mismatch that 502'd the live site).
-        local hp
-        case "$svc_id" in
-          ui)  hp=$(env_get UI_PORT  || true); hp="${hp:-4203}" ;;
-          *)   hp=$(env_get API_PORT || true); hp="${hp:-8203}" ;;
-        esac
-        if curl -fsS --max-time 3 "http://127.0.0.1:${hp}${path}" >/dev/null 2>&1; then
-          return 0
-        fi
-        ;;
-    esac
+  local elapsed=0 timeout port
+  timeout=$(health_timeout)
+  port=$(env_get UI_PORT || true); port="${port:-4203}"
+  while (( elapsed < timeout )); do
+    if curl -fsS --max-time 3 "http://127.0.0.1:${port}${HEALTH_PATH}" >/dev/null 2>&1; then
+      return 0
+    fi
     sleep "$HEALTHCHECK_POLL_INTERVAL"
     elapsed=$(( elapsed + HEALTHCHECK_POLL_INTERVAL ))
   done
@@ -405,79 +292,80 @@ wait_healthy() {
 # ─────────────────────────────────────────────────────────────
 
 cmd_list() {
-  # mode = versions (default, semver X.Y.Z tags) or builds (main-<sha> tags)
-  local mode="${1:-versions}"
-  local svc_id pattern
+  local mode="${1:-versions}"   # versions (semver) | builds (main-<sha>)
   printf '\n%sAvailable tags%s (mode=%s)\n\n' "${C_BOLD}" "${C_RESET}" "$mode"
-  for svc_id in $(detected_service_ids); do
-    local repo
-    repo=$(service_repo "$svc_id")
-    printf '%s%s%s (%s)\n' "${C_CYAN}" "$repo" "${C_RESET}" "$svc_id"
-    local tags
-    tags=$(ghcr_list_tags "$repo" 2>/dev/null || true)
-    if [[ -z "$tags" ]]; then
-      printf '  %s(no tags found or image not yet published)%s\n' "${C_DIM}" "${C_RESET}"
-      continue
-    fi
-    case "$mode" in
-      versions) pattern='^[0-9]+\.[0-9]+\.[0-9]+$' ;;
-      builds)   pattern='^main-[a-f0-9]+$' ;;
-      *)        pattern='.' ;;
-    esac
-    # sort -V for proper semver ordering (0.1.10 > 0.1.9, which alpha-sort gets wrong)
-    local matched
-    if [[ "$mode" == "versions" ]]; then
-      matched=$(printf '%s\n' "$tags" | grep -E "$pattern" | sort -Vr | head -10)
-    else
-      matched=$(printf '%s\n' "$tags" | grep -E "$pattern" | sort -r | head -10)
-    fi
-    if [[ -z "$matched" ]]; then
-      printf '  %s(no tags matching %s)%s\n' "${C_DIM}" "$pattern" "${C_RESET}"
-    else
-      printf '%s\n' "$matched" | sed 's/^/  /'
-    fi
-  done
+  printf '%s%s%s\n' "${C_CYAN}" "$IMAGE_REPO" "${C_RESET}"
+  local tags pattern matched
+  tags=$(ghcr_list_tags "$IMAGE_REPO" 2>/dev/null || true)
+  if [[ -z "$tags" ]]; then
+    printf '  %s(no tags found or image not yet published)%s\n\n' "${C_DIM}" "${C_RESET}"
+    return 0
+  fi
+  case "$mode" in
+    versions) pattern='^[0-9]+\.[0-9]+\.[0-9]+$'; matched=$(printf '%s\n' "$tags" | grep -E "$pattern" | sort -Vr | head -10) ;;
+    builds)   pattern='^main-[a-f0-9]+$';          matched=$(printf '%s\n' "$tags" | grep -E "$pattern" | sort -r  | head -10) ;;
+    *)        matched=$tags ;;
+  esac
+  if [[ -z "$matched" ]]; then
+    printf '  %s(no tags matching %s)%s\n' "${C_DIM}" "$pattern" "${C_RESET}"
+  else
+    printf '%s\n' "$matched" | sed 's/^/  /'
+  fi
   printf '\n'
 }
 
 cmd_status() {
   printf '\n%sDeploy status%s\n\n' "${C_BOLD}" "${C_RESET}"
-  local svc_id
-  for svc_id in $(detected_service_ids); do
-    local repo cur prior deployedAt compose_name cid health_status cmd
-    repo=$(service_repo "$svc_id")
-    compose_name=$(service_compose_name "$svc_id")
-    cur=$(state_get "$repo" current)
-    prior=$(state_get "$repo" prior)
-    deployedAt=$(state_get "$repo" deployedAt)
-    cmd=$(compose_for_service "$svc_id")
-    cid=$($cmd ps -q "$compose_name" 2>/dev/null || true)
-    if [[ -n "$cid" ]]; then
-      health_status=$(docker inspect --format '{{if .State.Health}}{{.State.Health.Status}}{{else}}{{if .State.Running}}running{{else}}stopped{{end}}{{end}}' "$cid" 2>/dev/null || echo unknown)
-    else
-      health_status="not-running"
-    fi
-    printf '%s%s%s\n' "${C_CYAN}" "$svc_id" "${C_RESET}"
-    printf '  current:    %s\n' "${cur:-<none>}"
-    printf '  prior:      %s\n' "${prior:-<none>}"
-    printf '  deployedAt: %s\n' "${deployedAt:-<none>}"
-    printf '  container:  %s\n\n' "$health_status"
-  done
+  local cur prior deployedAt cid health_status
+  cur=$(state_get current)
+  prior=$(state_get prior)
+  deployedAt=$(state_get deployedAt)
+  cid=$(compose ps -q "$COMPOSE_SERVICE" 2>/dev/null || true)
+  if [[ -n "$cid" ]]; then
+    health_status=$(docker inspect --format '{{if .State.Health}}{{.State.Health.Status}}{{else}}{{if .State.Running}}running{{else}}stopped{{end}}{{end}}' "$cid" 2>/dev/null || echo unknown)
+  else
+    health_status="not-running"
+  fi
+  printf '%s%s%s\n' "${C_CYAN}" "$COMPOSE_SERVICE" "${C_RESET}"
+  printf '  current:    %s\n' "${cur:-<none>}"
+  printf '  prior:      %s\n' "${prior:-<none>}"
+  printf '  deployedAt: %s\n' "${deployedAt:-<none>}"
+  printf '  container:  %s\n\n' "$health_status"
 }
 
 cmd_logs() {
-  if [[ ! -s "$LOG_FILE" ]]; then
-    warn "Log is empty: $LOG_FILE"
-    return 0
-  fi
+  [[ -s "$LOG_FILE" ]] || { warn "Log is empty: $LOG_FILE"; return 0; }
   tail -n 50 "$LOG_FILE"
+}
+
+cmd_up() {
+  preflight
+  local tag
+  tag=$(env_get "$IMAGE_ENVVAR" || true)
+  if [[ -z "$tag" || "$tag" == "latest" ]]; then
+    die "$IMAGE_ENVVAR is '${tag:-unset}' — pin an immutable tag first (aw-deploy <X.Y.Z|main-sha>)"
+  fi
+  step "Bringing up $COMPOSE_SERVICE on pinned $tag"
+  compose up -d --force-recreate "$COMPOSE_SERVICE"
+  step "Waiting for healthy ($(health_timeout) s max)"
+  if wait_healthy; then
+    ok "Service healthy on the published port"
+    state_set "$tag"
+  else
+    err "Published port did not answer — check 'aw-deploy --status' and host nginx"
+    return 1
+  fi
+}
+
+cmd_compose() {
+  preflight
+  [[ $# -gt 0 ]] || die "aw-deploy compose <args> — e.g. 'compose ps', 'compose logs -f armory-works-ui'"
+  compose "$@"
 }
 
 cmd_self_update() {
   step "Self-update: $REPO_ROOT"
-  if [[ ! -d "${REPO_ROOT}/.git" ]]; then
-    die "Not a git checkout: $REPO_ROOT"
-  fi
+  [[ -d "${REPO_ROOT}/.git" ]] || die "Not a git checkout: $REPO_ROOT"
   if ! git -C "$REPO_ROOT" diff --quiet HEAD -- 2>/dev/null; then
     die "Local changes to tracked files present in $REPO_ROOT — refusing to pull"
   fi
@@ -491,34 +379,21 @@ cmd_self_update() {
 }
 
 pick_tag_interactive() {
-  local svc_id="$1"
-  local repo
-  repo=$(service_repo "$svc_id")
   local tags
-  # Prefer semver versions (X.Y.Z). Fall back to main-<sha> if no versions exist yet
-  # (e.g. for an image that pre-dates the auto-version workflow).
-  tags=$(ghcr_list_tags "$repo" 2>/dev/null | grep -E '^[0-9]+\.[0-9]+\.[0-9]+$' | sort -Vr | head -5 || true)
-  if [[ -z "$tags" ]]; then
-    tags=$(ghcr_list_tags "$repo" 2>/dev/null | grep -E '^main-[a-f0-9]+$' | sort -r | head -5 || true)
-  fi
-  if [[ -z "$tags" ]]; then
-    die "No version or main-<sha> tags available for $repo"
-  fi
-  printf '\nRecent versions for %s:\n' "$repo" >&2
-  local i=1
-  local tag_array=()
+  tags=$(ghcr_list_tags "$IMAGE_REPO" 2>/dev/null | grep -E '^[0-9]+\.[0-9]+\.[0-9]+$' | sort -Vr | head -5 || true)
+  [[ -z "$tags" ]] && tags=$(ghcr_list_tags "$IMAGE_REPO" 2>/dev/null | grep -E '^main-[a-f0-9]+$' | sort -r | head -5 || true)
+  [[ -z "$tags" ]] && die "No version or main-<sha> tags available for $IMAGE_REPO"
+  printf '\nRecent versions for %s:\n' "$IMAGE_REPO" >&2
+  local i=1 tag_array=()
   while IFS= read -r t; do
     [[ -z "$t" ]] && continue
     tag_array+=("$t")
     printf '  [%d] %s\n' "$i" "$t" >&2
     i=$(( i + 1 ))
   done <<<"$tags"
-  printf '\nChoose [1-%d] (or Enter for 1, q to cancel): ' "${#tag_array[@]}" >&2
-  local choice
-  read -r choice
-  if [[ "$choice" == "q" || "$choice" == "Q" ]]; then
-    die "Cancelled by user"
-  fi
+  printf '\nChoose [1-%d] (Enter for 1, q to cancel): ' "${#tag_array[@]}" >&2
+  local choice; read -r choice
+  [[ "$choice" == "q" || "$choice" == "Q" ]] && die "Cancelled by user"
   choice="${choice:-1}"
   if ! [[ "$choice" =~ ^[0-9]+$ ]] || (( choice < 1 || choice > ${#tag_array[@]} )); then
     die "Invalid choice: $choice"
@@ -526,221 +401,96 @@ pick_tag_interactive() {
   printf '%s\n' "${tag_array[$(( choice - 1 ))]}"
 }
 
-deploy_service() {
-  local svc_id="$1" target_tag="$2"
-  local repo envvar compose_name prior_tag cmd
-  repo=$(service_repo "$svc_id")
-  envvar=$(service_envvar "$svc_id")
-  compose_name=$(service_compose_name "$svc_id")
-  cmd=$(compose_for_service "$svc_id")
+deploy() {
+  local target_tag="$1" prior_tag
+  prior_tag=$(state_get current)
+  [[ -z "$prior_tag" ]] && prior_tag=$(env_get "$IMAGE_ENVVAR")
 
-  prior_tag=$(state_get "$repo" current)
-  if [[ -z "$prior_tag" ]]; then
-    prior_tag=$(env_get "$envvar")
-  fi
+  step "Deploying $COMPOSE_SERVICE -> $target_tag"
 
-  step "Deploying $svc_id -> $target_tag"
-
-  if ! ghcr_tag_exists "$repo" "$target_tag"; then
-    err "Tag not found in GHCR: ${REGISTRY_OWNER}/${repo}:${target_tag}"
-    log_event "$svc_id" "$prior_tag" "$target_tag" "missing-in-ghcr"
+  if ! ghcr_tag_exists "$IMAGE_REPO" "$target_tag"; then
+    err "Tag not found in GHCR: ${REGISTRY_OWNER}/${IMAGE_REPO}:${target_tag}"
+    log_event "$prior_tag" "$target_tag" "missing-in-ghcr"
     return 1
   fi
   ok "Tag verified in GHCR"
 
-  env_set "$envvar" "$target_tag"
-  ok ".env updated: ${envvar}=${target_tag}"
+  env_set "$IMAGE_ENVVAR" "$target_tag"
+  ok ".env updated: ${IMAGE_ENVVAR}=${target_tag}"
 
-  if ! $cmd pull "$compose_name"; then
+  if ! compose pull "$COMPOSE_SERVICE"; then
     err "docker compose pull failed"
-    env_set "$envvar" "$prior_tag"
-    log_event "$svc_id" "$prior_tag" "$target_tag" "pull-failed"
+    env_set "$IMAGE_ENVVAR" "$prior_tag"
+    log_event "$prior_tag" "$target_tag" "pull-failed"
     return 1
   fi
   ok "Image pulled"
 
-  # ─── EF migrations (api service only) ───────────────────────────────
-  # The api image carries a self-contained migrations bundle at
-  # /app/efbundle, generated at image-build time via
-  # `dotnet ef migrations bundle --self-contained`. Run it against the
-  # running DB BEFORE we recreate the server container, so a bad
-  # migration aborts the deploy instead of crashlooping the new
-  # container after rollout. EF migrations are idempotent — re-running
-  # is a near-instant no-op when nothing's pending.
-  if [[ "$svc_id" == "api" ]]; then
-    step "Applying EF migrations"
-
-    local pg_db pg_user pg_pass network db_conn image
-    pg_db=$(env_get POSTGRES_DB)
-    pg_user=$(env_get POSTGRES_USER)
-    pg_pass=$(env_get POSTGRES_PASSWORD)
-    pg_db=${pg_db:-armory_works_db}
-    pg_user=${pg_user:-postgres}
-
-    if [[ -z "$pg_pass" ]]; then
-      err "POSTGRES_PASSWORD not set in .env — cannot run migrations"
-      env_set "$envvar" "$prior_tag"
-      log_event "$svc_id" "$prior_tag" "$target_tag" "missing-db-password"
-      return 1
-    fi
-
-    network=$(docker network ls --format '{{.Name}}' | grep -E '^armory-works-api_' | head -1)
-    if [[ -z "$network" ]]; then
-      err "Compose network armory-works-api_* not found — is armory-works-db up?"
-      env_set "$envvar" "$prior_tag"
-      log_event "$svc_id" "$prior_tag" "$target_tag" "no-network"
-      return 1
-    fi
-
-    db_conn="Host=armory-works-db;Port=5432;Database=${pg_db};Username=${pg_user};Password=${pg_pass}"
-    image="ghcr.io/${REGISTRY_OWNER}/armory-works-server:${target_tag}"
-
-    # docker run (not `compose run`) keeps this independent of compose's
-    # depends_on/profile semantics. The --network attachment is what
-    # lets the bundle reach the armory-works-db container by name.
-    if ! docker run --rm \
-        --network "$network" \
-        --entrypoint /app/efbundle \
-        "$image" \
-        --connection "$db_conn"; then
-      err "EF migration failed — aborting deploy, rolling .env back to $prior_tag"
-      env_set "$envvar" "$prior_tag"
-      log_event "$svc_id" "$prior_tag" "$target_tag" "migration-failed"
-      return 1
-    fi
-    ok "Migrations applied"
-  fi
-
-  if ! $cmd up -d --force-recreate "$compose_name"; then
-    err "docker compose up -d failed"
-    env_set "$envvar" "$prior_tag"
-    $cmd up -d --force-recreate "$compose_name" || true
-    log_event "$svc_id" "$prior_tag" "$target_tag" "up-failed"
+  if ! compose up -d --force-recreate "$COMPOSE_SERVICE"; then
+    err "docker compose up -d failed — rolling back"
+    env_set "$IMAGE_ENVVAR" "$prior_tag"
+    compose up -d --force-recreate "$COMPOSE_SERVICE" || true
+    log_event "$prior_tag" "$target_tag" "up-failed"
     return 1
   fi
   ok "Container started"
 
-  step "Waiting for healthy ($HEALTHCHECK_TIMEOUT_SECS s max)"
-  if wait_healthy "$svc_id"; then
-    ok "Service healthy"
-    state_set "$repo" "$target_tag"
-    log_event "$svc_id" "$prior_tag" "$target_tag" "ok"
+  step "Waiting for healthy ($(health_timeout) s max)"
+  if wait_healthy; then
+    ok "Service healthy on the published port"
+    state_set "$target_tag"
+    log_event "$prior_tag" "$target_tag" "ok"
     return 0
   fi
 
-  err "Service did not become healthy — rolling back to $prior_tag"
+  err "Published port did not answer — rolling back to ${prior_tag:-<none>}"
   if [[ -n "$prior_tag" && "$prior_tag" != "$target_tag" ]]; then
-    env_set "$envvar" "$prior_tag"
-    $cmd up -d --force-recreate "$compose_name" || true
+    env_set "$IMAGE_ENVVAR" "$prior_tag"
+    compose up -d --force-recreate "$COMPOSE_SERVICE" || true
   fi
-  log_event "$svc_id" "$prior_tag" "$target_tag" "unhealthy-rolled-back"
+  log_event "$prior_tag" "$target_tag" "unhealthy-rolled-back"
   return 1
 }
 
-cmd_deploy() {
-  local target_services=("$@")
-  local explicit_tag="${EXPLICIT_TAG:-}"
-
-  local svc_id
-  local failed=0
-  for svc_id in "${target_services[@]}"; do
-    local tag
-    if [[ -n "$explicit_tag" ]]; then
-      tag="$explicit_tag"
-    else
-      tag=$(pick_tag_interactive "$svc_id")
-    fi
-    validate_tag "$tag"
-    if ! deploy_service "$svc_id" "$tag"; then
-      failed=1
-    fi
-  done
-
-  if (( failed )); then
-    err "One or more services failed to deploy — check $LOG_FILE"
-    exit 1
-  fi
-  ok "All targeted services deployed successfully"
-}
-
 cmd_rollback() {
-  local svc_id="${1:-all}"
-  local target_services
-  if [[ "$svc_id" == "all" ]]; then
-    mapfile -t target_services < <(detected_service_ids)
-  else
-    if ! service_repo "$svc_id" >/dev/null 2>&1; then
-      die "Unknown service: $svc_id"
-    fi
-    target_services=("$svc_id")
-  fi
-  local failed=0
-  for svc_id in "${target_services[@]}"; do
-    local repo prior
-    repo=$(service_repo "$svc_id")
-    prior=$(state_get "$repo" prior)
-    if [[ -z "$prior" ]]; then
-      warn "No prior tag recorded for $svc_id — skipping"
-      continue
-    fi
-    step "Rollback $svc_id -> $prior"
-    if ! deploy_service "$svc_id" "$prior"; then
-      failed=1
-    fi
-  done
-  if (( failed )); then exit 1; fi
+  local prior
+  prior=$(state_get prior)
+  [[ -n "$prior" ]] || die "No prior tag recorded — nothing to roll back to"
+  step "Rollback $COMPOSE_SERVICE -> $prior"
+  deploy "$prior"
 }
 
 # ─────────────────────────────────────────────────────────────
-# Argument parsing
+# Main
 # ─────────────────────────────────────────────────────────────
-
-parse_service_arg() {
-  local arg="$1"
-  case "$arg" in
-    all)
-      detected_service_ids ;;
-    api|ui)
-      local found=false svc
-      for svc in $(detected_service_ids); do
-        [[ "$svc" == "$arg" ]] && { found=true; break; }
-      done
-      $found || die "Service '$arg' is not configured on this host (compose file missing)"
-      printf '%s\n' "$arg" ;;
-    *)
-      die "Unknown --service value: $arg (api|ui|all)" ;;
-  esac
-}
 
 main() {
+  # `compose` subcommand: pass everything after it to the scoped wrapper.
+  if [[ "${1:-}" == "compose" ]]; then
+    shift; cmd_compose "$@"; return
+  fi
+
   if [[ $# -eq 0 ]]; then
     preflight
-    local services
-    mapfile -t services < <(detected_service_ids)
-    [[ ${#services[@]} -eq 0 ]] && die "No services detected (no compose files at $REPO_ROOT)"
-    EXPLICIT_TAG=""
-    cmd_deploy "${services[@]}"
+    local tag; tag=$(pick_tag_interactive)
+    validate_tag "$tag"
+    deploy "$tag" || { err "Deploy failed — check $LOG_FILE"; exit 1; }
     return
   fi
 
-  local mode="" service_arg="" positional=""
-  # list_mode = "versions" (semver, default) | "builds" (main-<sha>)
-  local list_mode="versions"
+  local mode="" positional="" list_mode="versions"
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --help|-h)     usage; exit 0 ;;
       --version|-V)  printf 'aw-deploy %s\n' "$AW_DEPLOY_VERSION"; exit 0 ;;
       --list)        mode="list"; shift ;;
-      --releases)    list_mode="versions"; shift ;;  # legacy alias, semver default
-      --builds)      list_mode="builds";   shift ;;  # opt-in for main-<sha> tags
+      --releases)    list_mode="versions"; shift ;;
+      --builds)      list_mode="builds"; shift ;;
       --status)      mode="status"; shift ;;
       --rollback)    mode="rollback"; shift ;;
       --logs)        mode="logs"; shift ;;
+      --up|--start)  mode="up"; shift ;;
       --self-update) mode="self-update"; shift ;;
-      --service)
-        [[ $# -ge 2 ]] || die "--service requires a value (api|ui|all)"
-        service_arg="$2"; shift 2 ;;
-      --service=*)   service_arg="${1#*=}"; shift ;;
       -*)            die "Unknown option: $1 (try --help)" ;;
       *)
         [[ -n "$positional" ]] && die "Unexpected extra argument: $1"
@@ -749,43 +499,18 @@ main() {
   done
 
   case "$mode" in
-    list)
-      preflight
-      cmd_list "$list_mode"
-      ;;
-    status)
-      preflight
-      cmd_status
-      ;;
-    rollback)
-      preflight
-      if [[ -n "$service_arg" ]]; then
-        cmd_rollback "$service_arg"
-      else
-        cmd_rollback all
-      fi
-      ;;
-    logs)
-      cmd_logs
-      ;;
-    self-update)
-      cmd_self_update
-      ;;
+    list)        preflight; cmd_list "$list_mode" ;;
+    status)      preflight; cmd_status ;;
+    rollback)    preflight; cmd_rollback ;;
+    logs)        cmd_logs ;;
+    up)          cmd_up ;;
+    self-update) cmd_self_update ;;
     "")
       preflight
-      local services
-      if [[ -n "$service_arg" ]]; then
-        mapfile -t services < <(parse_service_arg "$service_arg")
-      else
-        mapfile -t services < <(detected_service_ids)
-      fi
-      [[ ${#services[@]} -eq 0 ]] && die "No services detected (no compose files at $REPO_ROOT)"
-      EXPLICIT_TAG="$positional"
-      cmd_deploy "${services[@]}"
+      validate_tag "$positional"
+      deploy "$positional" || { err "Deploy failed — check $LOG_FILE"; exit 1; }
       ;;
-    *)
-      die "Internal error: unhandled mode '$mode'"
-      ;;
+    *) die "Internal error: unhandled mode '$mode'" ;;
   esac
 }
 

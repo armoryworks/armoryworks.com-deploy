@@ -1,0 +1,111 @@
+#!/usr/bin/env bash
+# aw-preflight — read-only deploy doctor for armoryworks.com.
+#
+# Validates the things that actually bite this deploy and FAILS LOUD with the
+# exact fix BEFORE you deploy. Changes nothing — pure diagnosis. The AW-trivial
+# slice of forge-preflight (single static service, one box).
+#
+#   aw-preflight            run all checks, exit 0 (GO) / 1 (issues)
+#   aw-preflight --quiet    only print problems + the verdict
+#
+# Failure modes mapped to real incidents:
+#   * floating `latest` tag        → a bad build crash-loops with no pin to roll back to
+#   * port mismatch / dead upstream → host nginx 502 even though the container is "healthy"
+#   * git ownership / perms        → `git pull` blocked ("dubious ownership")
+#   * CRLF in *.sh                 → "bad interpreter: ...^M" on Linux
+#   * missing maintenance page     → error_page fallback has no file to serve
+set -uo pipefail   # no -e: every check must run and tally, not abort early
+
+readonly REPO_ROOT="${AW_DEPLOY_REPO:-/opt/armoryworks-deploy}"
+readonly ENV_FILE="${REPO_ROOT}/.env"
+readonly COMPOSE_WEB="${REPO_ROOT}/docker-compose.web.yml"
+readonly EXPECTED_REMOTE="armoryworks/armoryworks.com-deploy"
+readonly STATE_DIR="/etc/armoryworks"
+readonly STATE_FILE="${STATE_DIR}/deploy-state.json"
+readonly MAINT_FILE="/var/www/armoryworks-maintenance/maintenance.html"
+
+if [[ -n "${NO_COLOR:-}" ]] || [[ ! -t 1 ]]; then
+  C_RESET=""; C_RED=""; C_GREEN=""; C_YELLOW=""; C_CYAN=""; C_BOLD=""; C_DIM=""
+else
+  C_RESET=$'\033[0m'; C_RED=$'\033[31m'; C_GREEN=$'\033[32m'; C_YELLOW=$'\033[33m'
+  C_CYAN=$'\033[36m'; C_BOLD=$'\033[1m'; C_DIM=$'\033[2m'
+fi
+QUIET=0; [[ "${1:-}" == "--quiet" ]] && QUIET=1
+
+PASS=0; WARN=0; FAIL=0
+section() { (( QUIET )) || printf '\n%s== %s ==%s\n' "${C_CYAN}${C_BOLD}" "$1" "${C_RESET}"; }
+pass() { PASS=$((PASS+1)); (( QUIET )) || printf '  %s[OK]%s %s\n' "${C_GREEN}" "${C_RESET}" "$1"; }
+warn() { WARN=$((WARN+1)); printf '  %s[!!]%s %s\n' "${C_YELLOW}" "${C_RESET}" "$1"; [[ -n "${2:-}" ]] && printf '       %sfix: %s%s\n' "${C_DIM}" "$2" "${C_RESET}"; }
+fail() { FAIL=$((FAIL+1)); printf '  %s[XX]%s %s\n' "${C_RED}" "${C_RESET}" "$1" >&2; [[ -n "${2:-}" ]] && printf '       %sfix: %s%s\n' "${C_DIM}" "$2" "${C_RESET}"; }
+
+envval() { [[ -f "$ENV_FILE" ]] || return 1; grep -E "^${1}=" "$ENV_FILE" 2>/dev/null | tail -1 | cut -d= -f2- | tr -d '"'"'"'' | xargs 2>/dev/null; }
+
+# ── 1. Repo + remote ──────────────────────────────────────────
+section "Repo & remote"
+if [[ ! -d "$REPO_ROOT" ]]; then
+  fail "deploy repo not found at $REPO_ROOT" "git clone https://github.com/${EXPECTED_REMOTE}.git $REPO_ROOT"
+elif ! git -C "$REPO_ROOT" rev-parse --git-dir >/dev/null 2>&1; then
+  fail "$REPO_ROOT is not a git checkout" "git clone https://github.com/${EXPECTED_REMOTE}.git $REPO_ROOT"
+else
+  remote=$(git -C "$REPO_ROOT" remote get-url origin 2>/dev/null || echo "")
+  if [[ "$remote" == *"$EXPECTED_REMOTE"* ]]; then pass "origin = $EXPECTED_REMOTE"
+  else fail "origin is '$remote', expected *${EXPECTED_REMOTE}*" "wrong repo? this should be armoryworks.com-deploy"; fi
+fi
+
+# ── 2. Ownership / writability ────────────────────────────────
+section "Ownership & permissions"
+if [[ -d "$REPO_ROOT/.git" ]]; then
+  if git -C "$REPO_ROOT" status >/dev/null 2>&1; then pass "git usable as $(id -un)"
+  else fail "git refuses $REPO_ROOT (dubious ownership / perms)" \
+            "git config --global --add safe.directory $REPO_ROOT ; sudo chown -R \$(id -un):\$(id -gn) $REPO_ROOT"; fi
+fi
+
+# ── 3. Line endings ───────────────────────────────────────────
+section "Line endings"
+crlf=$(grep -rlIU $'\r' "$REPO_ROOT" --include='*.sh' 2>/dev/null | grep -v '/\.git/' | head -5)
+if [[ -z "$crlf" ]]; then pass "no CRLF in *.sh"
+else fail "CRLF found in: $(echo "$crlf" | tr '\n' ' ')" "add .gitattributes (*.sh text eol=lf) then: sed -i 's/\\r\$//' <file>"; fi
+
+# ── 4. Docker + compose plugin ────────────────────────────────
+section "Docker"
+if docker version >/dev/null 2>&1; then pass "docker reachable as $(id -un)"
+else fail "cannot reach docker daemon" "add $(id -un) to the docker group or run with sudo"; fi
+if docker compose version >/dev/null 2>&1; then pass "docker compose plugin present"
+else fail "docker compose plugin missing" "install docker-compose-v2 / docker-compose-plugin"; fi
+
+# ── 5. Compose + .env + image tag ─────────────────────────────
+section "Compose & environment"
+[[ -f "$COMPOSE_WEB" ]] && pass "docker-compose.web.yml present" \
+  || fail "docker-compose.web.yml missing at $REPO_ROOT" "wrong AW_DEPLOY_REPO?"
+if [[ ! -f "$ENV_FILE" ]]; then
+  fail ".env missing at $ENV_FILE" "cp .env.web.example .env  (then run setup-web.sh)"
+else
+  pass ".env present"
+  tag=$(envval UI_IMAGE_TAG || echo "")
+  if [[ -z "$tag" ]]; then warn "UI_IMAGE_TAG not set" "aw-deploy --list, then aw-deploy <X.Y.Z>"
+  elif [[ "$tag" == "latest" ]]; then
+    fail "UI_IMAGE_TAG=latest (floating tag — no immutable pin to roll back to)" "aw-deploy <X.Y.Z|main-sha> to pin an immutable tag"
+  else pass "UI_IMAGE_TAG pinned: $tag"; fi
+fi
+
+# ── 6. GHCR credentials ───────────────────────────────────────
+section "GHCR auth"
+if [[ -r "${STATE_DIR}/ghcr-user" && -r "${STATE_DIR}/ghcr-token" ]]; then pass "GHCR creds present in $STATE_DIR"
+else fail "GHCR creds missing in $STATE_DIR" "run scripts/install-aw-deploy.sh (prompts for a read:packages PAT)"; fi
+
+# ── 7. Deploy state ───────────────────────────────────────────
+section "Deploy state"
+if [[ -f "$STATE_FILE" ]]; then pass "state file present: $STATE_FILE"
+else warn "no $STATE_FILE yet" "run scripts/install-aw-deploy.sh"; fi
+
+# ── 8. Maintenance page (the error_page fallback target) ──────
+section "Maintenance page"
+if [[ -f "$MAINT_FILE" ]]; then pass "maintenance page installed: $MAINT_FILE"
+else warn "maintenance page not installed at $MAINT_FILE" \
+          "sudo install -D -m 0644 ops/maintenance/maintenance.html $MAINT_FILE (or re-run setup-web.sh)"; fi
+
+# ── Verdict ───────────────────────────────────────────────────
+printf '\n%s%s── preflight: %d ok, %d warn, %d fail ──%s\n' "${C_BOLD}" "${C_CYAN}" "$PASS" "$WARN" "$FAIL" "${C_RESET}"
+if (( FAIL > 0 )); then printf '%sNO-GO%s — fix the [XX] items before deploying.\n' "${C_RED}${C_BOLD}" "${C_RESET}"; exit 1; fi
+if (( WARN > 0 )); then printf '%sGO (with warnings)%s — review the [!!] items.\n' "${C_YELLOW}${C_BOLD}" "${C_RESET}"; exit 0; fi
+printf '%sGO%s — environment is clean.\n' "${C_GREEN}${C_BOLD}" "${C_RESET}"; exit 0

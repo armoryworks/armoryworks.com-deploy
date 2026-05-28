@@ -30,7 +30,7 @@
 #
 # PAT scopes required:
 #   - Classic PAT: read:packages
-#   - Fine-grained PAT: Read on the specific packages (armory-works-server, armory-works-ui)
+#   - Fine-grained PAT: Read on the armory-works-ui package
 #
 # Non-interactive override:
 #   GHCR_USER=<gh-username> GHCR_TOKEN=ghp_xxx ./install-aw-deploy.sh
@@ -41,12 +41,9 @@ REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 DEPLOY_USER="${SUDO_USER:-$USER}"
 
 SKIP_AUTH=false
-ROLE_ARG=""  # --role api|web|all from CLI, optional
 for arg in "$@"; do
     case "$arg" in
         --skip-auth)   SKIP_AUTH=true ;;
-        --role=api|--role=web|--role=all) ROLE_ARG="${arg#*=}" ;;
-        --role)        echo "Use --role=api or --role=web or --role=all" >&2; exit 1 ;;
         *) echo "Unknown option: $arg"; exit 1 ;;
     esac
 done
@@ -64,9 +61,13 @@ done
 docker compose version >/dev/null 2>&1 || fail "Missing: docker compose plugin"
 ok "All prereqs present"
 
-step "Installing aw-deploy to /usr/local/bin/"
+step "Installing aw-deploy + aw-preflight to /usr/local/bin/"
 sudo install -m 0755 "${REPO_ROOT}/scripts/aw-deploy" /usr/local/bin/aw-deploy
 ok "/usr/local/bin/aw-deploy"
+if [[ -f "${REPO_ROOT}/scripts/aw-preflight" ]]; then
+    sudo install -m 0755 "${REPO_ROOT}/scripts/aw-preflight" /usr/local/bin/aw-preflight
+    ok "/usr/local/bin/aw-preflight"
+fi
 
 step "Creating /etc/armoryworks/"
 if [[ ! -d /etc/armoryworks ]]; then
@@ -96,64 +97,9 @@ else
     ok "aw-deploy.log already exists"
 fi
 
-# ─────────────────────────────────────────────────────────────
-# Role marker — which services does THIS host manage?
-# ─────────────────────────────────────────────────────────────
-#
-# The deploy repo carries both docker-compose.api.yml AND docker-compose.web.yml
-# because it's the same repo deployed to either host type. Without a role
-# marker, aw-deploy can't tell which services this host should manage and
-# would try to deploy everything everywhere. /etc/armoryworks/role pins it.
-
-step "Setting host role"
-
-ROLE=""
-if [[ -r /etc/armoryworks/role ]]; then
-    ROLE=$(tr -d '\n\r' </etc/armoryworks/role 2>/dev/null || echo "")
-fi
-
-if [[ -n "$ROLE" ]]; then
-    ok "Role already set: ${ROLE}"
-elif [[ -n "$ROLE_ARG" ]]; then
-    ROLE="$ROLE_ARG"
-    ok "Role from --role flag: ${ROLE}"
-else
-    # Try to infer from hostname. armoryworks-api → api, armoryworks-web → web.
-    HOST=$(hostname 2>/dev/null || echo "")
-    case "$HOST" in
-        *-api*|*api*) GUESS=api ;;
-        *-web*|*web*) GUESS=web ;;
-        *)            GUESS="" ;;
-    esac
-
-    echo ""
-    if [[ -n "$GUESS" ]]; then
-        echo "    Hostname '${HOST}' suggests role: ${GUESS}"
-        read -rp "    Use role '${GUESS}'? (Y/n/api/web/all) " ans
-        case "${ans:-Y}" in
-            ""|y|Y|yes) ROLE="$GUESS" ;;
-            api|web|all) ROLE="$ans" ;;
-            n|N) read -rp "    Enter role (api | web | all): " ROLE ;;
-            *) ROLE="$ans" ;;
-        esac
-    else
-        echo "    What role does this host play?"
-        echo "      api → runs db + server (.NET API + Postgres)"
-        echo "      web → runs ui (Angular)"
-        echo "      all → single-host (local dev / rare prod)"
-        read -rp "    Role: " ROLE
-    fi
-
-    case "$ROLE" in
-        api|web|all) ok "Role: ${ROLE}" ;;
-        *) fail "Invalid role '${ROLE}' (must be api, web, or all)" ;;
-    esac
-fi
-
-printf '%s\n' "$ROLE" | sudo tee /etc/armoryworks/role >/dev/null
-sudo chown "$DEPLOY_USER":"$DEPLOY_USER" /etc/armoryworks/role
-sudo chmod 0644 /etc/armoryworks/role
-ok "Wrote /etc/armoryworks/role"
+# No host-role marker: armoryworks.com is a single static service on one box.
+# (The old api/web split — and /etc/armoryworks/role — is retired; aw-deploy
+# no longer reads it.)
 
 # ─────────────────────────────────────────────────────────────
 # GHCR auth
@@ -206,9 +152,10 @@ ok "aw-deploy is ready"
 
 printf '\n'
 echo "Next steps:"
-echo "  - First-time setup:   cd ${REPO_ROOT} && ./setup-api.sh   (or ./setup-web.sh)"
+echo "  - First-time setup:   cd ${REPO_ROOT} && ./setup-web.sh"
+echo "  - Preflight check:    aw-preflight"
 echo "  - List available:     aw-deploy --list"
-echo "  - Deploy a tag:       aw-deploy main-<sha>"
+echo "  - Deploy a tag:       aw-deploy <X.Y.Z|main-sha>"
 echo "  - Interactive:        aw-deploy"
 echo "  - Status:             aw-deploy --status"
 echo "  - Rollback:           aw-deploy --rollback"
