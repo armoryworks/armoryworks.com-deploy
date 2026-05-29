@@ -66,8 +66,9 @@ The health gate curls the **host-published port** (`127.0.0.1:UI_PORT/`), not ju
 
 - `setup-web.sh` creates the dir and seeds a placeholder `index.html` so `/writing/` doesn't 404 before Tuyere publishes. The bind mount **shadows** the image's baked `/writing`, so the seed (or Tuyere's output) is required.
 - **Rollout note:** on an existing box, re-run `./setup-web.sh` (or pre-create + seed the dir) before deploying an image built with this compose change — otherwise the empty auto-created mount makes `/writing/` 404 until Tuyere publishes.
-- Tuyere needs **write** access to `WRITING_CONTENT_DIR`; the UI container only reads it. Sort out ownership when wiring the Tuyere side (shared user/group).
-- Slug moves/removals (301/410) are **not** wired yet — that's part of the Tuyere build (nginx-reload coordination TBD).
+- `setup-web.sh` also seeds an empty `_redirects.map` so the nginx redirect `map` include resolves before Tuyere's first publish.
+- Tuyere needs **write** access to `WRITING_CONTENT_DIR`; the UI container only reads it. tuyere-api (co-hosted) mounts the same dir read-write in its compose (`Writing__OutputDirectory=/srv/writing`, `WRITING_CONTENT_DIR` in the Tuyere `.env`) and runs as the image's non-root user — `chown` the dir to that uid (or a shared group) and keep it world-readable so nginx can serve it.
+- **Slug moves → 301:** Tuyere maintains `_redirects.map` (old `/writing` path → current URL) in the content dir; the `map` + server `if` block in `ops/nginx/armoryworks.com.conf` applies the 301s. nginx re-reads the include only on reload, so run `ops/writing-reload.sh` (inotify → `nginx -t && nginx -s reload`) as a root service. **Removals:** Tuyere prunes the page and drops it from the index + feed, so nginx then returns a normal 404 (no explicit 410).
 
 ## 7. Co-host port map
 

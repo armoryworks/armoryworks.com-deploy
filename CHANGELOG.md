@@ -6,6 +6,7 @@ Notable changes to `armoryworks.com-deploy`. Format follows [Keep a Changelog](h
 
 ### Added
 - Dynamic `/writing` content area: a host dir (`WRITING_CONTENT_DIR`, default `/var/lib/armoryworks/writing`) bind-mounted **read-only** into the UI container at `/usr/share/nginx/html/writing`, for the co-hosted Tuyere writing CMS to render posts + index + `feed.xml` into. Serving stays pure-static (nginx reads files; never calls Tuyere). `setup-web.sh` creates + seeds the dir with a placeholder index (the mount shadows the image's baked `/writing`). See `docs/DEPLOY.md` §6b.
+- Writing CMS slug-move **301 redirects**: `ops/nginx/armoryworks.com.conf` gains a `map $uri $writing_redirect` (reads `_redirects.map`, maintained by Tuyere on publish) + an apex `return 301`; `setup-web.sh` seeds an empty `_redirects.map`; `ops/writing-reload.sh` (inotify) runs `nginx -t && nginx -s reload` when Tuyere rewrites the map. See `docs/DEPLOY.md` §6b.
 
 ### Changed
 - `docker-compose.web.yml`, `.env.web.example`, `setup-web.sh` — dropped stale Angular-/api-box header comments now that this box is static-site only.

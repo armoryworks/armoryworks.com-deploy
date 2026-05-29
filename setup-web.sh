@@ -208,6 +208,17 @@ else
     ok "/writing/index.html already present — leaving it"
 fi
 
+# Seed an empty 301 redirect map so the host-nginx `map … include` resolves
+# before Tuyere has published any slug moves (nginx -t errors on a missing
+# include file). Tuyere overwrites this on every publish.
+if [[ ! -e "$WRITING_DIR/_redirects.map" ]]; then
+    sudo touch "$WRITING_DIR/_redirects.map"
+    sudo chmod 0644 "$WRITING_DIR/_redirects.map"
+    ok "Seeded empty /writing/_redirects.map (Tuyere maintains it)"
+else
+    ok "/writing/_redirects.map already present — leaving it"
+fi
+
 info "Tuyere (co-hosted) needs WRITE access to $WRITING_DIR; the UI container"
 info "mounts it read-only. Grant Tuyere's service user/group write when you"
 info "wire up the Tuyere side."
