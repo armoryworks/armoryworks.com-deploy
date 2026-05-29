@@ -219,9 +219,16 @@ else
     ok "/writing/_redirects.map already present — leaving it"
 fi
 
-info "Tuyere (co-hosted) needs WRITE access to $WRITING_DIR; the UI container"
-info "mounts it read-only. Grant Tuyere's service user/group write when you"
-info "wire up the Tuyere side."
+# The tuyere-writing-receiver container writes here as its image's non-root
+# user (.NET aspnet image: uid 1654). nginx in the armory-works-ui container
+# reads it via the RO mount; world-readable (a+rX) covers both.
+RECEIVER_UID="${WRITING_RECEIVER_UID:-1654}"
+sudo chown -R "$RECEIVER_UID":"$RECEIVER_UID" "$WRITING_DIR"
+sudo chmod -R a+rX "$WRITING_DIR"
+ok "Ownership: uid $RECEIVER_UID writes; UI nginx reads (world-readable)"
+
+info "Set WRITING_RECEIVER_TOKEN in .env (and the SAME value in the Tuyere"
+info "env on the API box) so tuyere-api can authenticate to the receiver."
 
 # ─────────────────────────────────────────────────────────────
 # 5. Start UI

@@ -10,6 +10,7 @@ Notable changes to `armoryworks.com-deploy`. Format follows [Keep a Changelog](h
 
 ### Changed
 - `docker-compose.web.yml`, `.env.web.example`, `setup-web.sh` — dropped stale Angular-/api-box header comments now that this box is static-site only.
+- Writing CMS handoff switched from a co-host shared-FS mount to a dedicated **`tuyere-writing-receiver`** service in this compose. `tuyere-api` (API box) POSTs gzipped tar bundles over the backhaul; the receiver atomically extracts to `WRITING_CONTENT_DIR`. This restores the umbrella's two-box split (Tuyere on the API box). `setup-web.sh` now `chown`s the writing dir to the receiver's image uid (`WRITING_RECEIVER_UID`, default 1654); `.env.web.example` gains `WRITING_RECEIVER_{IMAGE_TAG,BIND,PORT,TOKEN}`; the bearer token must match the value in the Tuyere env on the API box.
 
 ## [0.2.0] — 2026-05-28
 

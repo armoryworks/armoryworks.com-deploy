@@ -41,3 +41,19 @@ services:
       # never calls Tuyere at request time. The mount shadows the image's baked
       # /writing — once Tuyere is live, the Eleventy /writing pipeline retires.
       - "${WRITING_CONTENT_DIR:-/var/lib/armoryworks/writing}:/usr/share/nginx/html/writing:ro"
+
+  # Writing CMS receiver — accepts gzipped tar bundles from tuyere-api (on the
+  # API box) over the backhaul, atomically extracts them into the host dir above
+  # (which armory-works-ui mounts read-only). tuyere-api is the only client; bind
+  # to the web-box LAN IP and restrict 5103 to the API box's IP via UFW.
+  tuyere-writing-receiver:
+    image: ghcr.io/armoryworks/tuyere-writing-receiver:${WRITING_RECEIVER_IMAGE_TAG:-edge}
+    container_name: tuyere-writing-receiver
+    restart: unless-stopped
+    environment:
+      Receiver__TargetDirectory: /srv/writing
+      Receiver__Token: ${WRITING_RECEIVER_TOKEN:?set the shared bearer token (also set on tuyere-api)}
+    ports:
+      - "${WRITING_RECEIVER_BIND:-127.0.0.1}:${WRITING_RECEIVER_PORT:-5103}:8080"
+    volumes:
+      - "${WRITING_CONTENT_DIR:-/var/lib/armoryworks/writing}:/srv/writing"
