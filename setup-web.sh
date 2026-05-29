@@ -431,6 +431,99 @@ AWT_RECEIVER
 EOF
 
 # ─────────────────────────────────────────────────────────────
+# 4i. tuyere.armoryworks.com nginx vhost (idempotent)
+#     Without this, requests to tuyere.armoryworks.com hit the default 443
+#     server (the www -> apex redirect) and bounce to armoryworks.com.
+#     Requires the Cloudflare Origin Cert files to be present.
+# ─────────────────────────────────────────────────────────────
+
+step "Installing tuyere.armoryworks.com nginx vhost"
+
+TUYERE_VHOST_TARGET=/etc/nginx/sites-available/tuyere.armoryworks.com.conf
+TUYERE_VHOST_LINK=/etc/nginx/sites-enabled/tuyere.armoryworks.com.conf
+TUYERE_CERT_DIR=/etc/letsencrypt/live/tuyere.armoryworks.com.cloudflare
+
+if [[ ! -f "$TUYERE_CERT_DIR/fullchain.pem" ]]; then
+    warn "Cloudflare Origin Cert missing at $TUYERE_CERT_DIR/ — skipping tuyere vhost"
+    warn "  Install it first:"
+    warn "    Cloudflare dashboard -> armoryworks.com -> SSL/TLS -> Origin Server"
+    warn "    -> Create Certificate (hostname: tuyere.armoryworks.com, validity 15y)"
+    warn "  Then on this box:"
+    warn "    sudo mkdir -p $TUYERE_CERT_DIR"
+    warn "    sudo nano $TUYERE_CERT_DIR/fullchain.pem      # paste the cert"
+    warn "    sudo nano $TUYERE_CERT_DIR/privkey.pem        # paste the key"
+    warn "    sudo chmod 600 $TUYERE_CERT_DIR/privkey.pem"
+    warn "  Then re-run ./setup-web.sh."
+elif [[ -z "${API_BOX_IP_ALLOW:-}" ]]; then
+    warn "WRITING_RECEIVER_ALLOW_FROM missing — can't render tuyere vhost (needs API box IP)"
+else
+    NEW_VHOST=$(cat <<CONF
+# Host nginx vhost for tuyere.armoryworks.com (managed by setup-web.sh).
+# TLS terminates here (Cloudflare Origin Cert); inbound is Cloudflare Tunnel.
+# /     -> local tuyere-admin-ui SPA (127.0.0.1:5101; future)
+# /api  -> tuyere-api on the API box LAN (${API_BOX_IP_ALLOW}:5100)
+
+server {
+    listen 127.0.0.1:443 ssl;
+    listen [::1]:443 ssl;
+    http2 on;
+    server_name tuyere.armoryworks.com;
+
+    ssl_certificate     $TUYERE_CERT_DIR/fullchain.pem;
+    ssl_certificate_key $TUYERE_CERT_DIR/privkey.pem;
+
+    ssl_protocols       TLSv1.2 TLSv1.3;
+    ssl_ciphers         ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384:ECDHE-ECDSA-CHACHA20-POLY1305:ECDHE-RSA-CHACHA20-POLY1305:ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256;
+    ssl_prefer_server_ciphers off;
+    ssl_session_timeout 1d;
+    ssl_session_cache   shared:MozSSL:10m;
+    ssl_session_tickets off;
+
+    add_header Strict-Transport-Security "max-age=15768000; includeSubDomains" always;
+    add_header X-Content-Type-Options    "nosniff"                             always;
+    add_header X-Frame-Options           "DENY"                                always;
+    add_header Referrer-Policy           "strict-origin-when-cross-origin"     always;
+
+    client_max_body_size 2m;
+
+    location /api/ {
+        proxy_pass http://${API_BOX_IP_ALLOW}:5100;
+        proxy_http_version 1.1;
+        proxy_set_header Host              \$host;
+        proxy_set_header X-Real-IP         \$remote_addr;
+        proxy_set_header X-Forwarded-For   \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto \$scheme;
+    }
+
+    location / {
+        proxy_pass http://127.0.0.1:5101;
+        proxy_http_version 1.1;
+        proxy_set_header Host              \$host;
+        proxy_set_header X-Forwarded-For   \$proxy_add_x_forwarded_for;
+        proxy_set_header X-Forwarded-Proto \$scheme;
+    }
+}
+CONF
+)
+    if [[ "$(sudo cat "$TUYERE_VHOST_TARGET" 2>/dev/null || true)" != "$NEW_VHOST" ]]; then
+        echo "$NEW_VHOST" | sudo tee "$TUYERE_VHOST_TARGET" >/dev/null
+        ok "Installed $TUYERE_VHOST_TARGET (API box: ${API_BOX_IP_ALLOW})"
+    else
+        ok "tuyere vhost already up to date"
+    fi
+    [[ -L "$TUYERE_VHOST_LINK" || -e "$TUYERE_VHOST_LINK" ]] || sudo ln -s "$TUYERE_VHOST_TARGET" "$TUYERE_VHOST_LINK"
+
+    if sudo nginx -t >/dev/null 2>&1; then
+        sudo systemctl reload nginx
+        ok "nginx -t OK, reloaded"
+    else
+        fail "nginx -t FAILED on tuyere vhost"
+        sudo nginx -t
+        exit 1
+    fi
+fi
+
+# ─────────────────────────────────────────────────────────────
 # 4j. Cloudflared tunnel ingress for tuyere.armoryworks.com
 #     (idempotent: skips if already wired; YAML-edited, not sed-hacked)
 # ─────────────────────────────────────────────────────────────
