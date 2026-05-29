@@ -421,6 +421,7 @@ Paste THIS on the API box, in the tuyere-deploy directory, to wire
 tuyere-api to this receiver. Run it BEFORE \`./deploy.sh --role api\`.
 ═══════════════════════════════════════════════════════════════════════
 
+  mkdir -p secrets
   cat >> secrets/tuyere.env <<'AWT_RECEIVER'
 WRITING_RECEIVER_BASE_URL=$RECEIVER_URL
 WRITING_RECEIVER_TOKEN=$CURRENT_TOKEN
