@@ -36,13 +36,9 @@ Writes `.env` from `.env.web.example`, installs the maintenance page to `/var/ww
 
 ## 5. Host nginx + tunnel (one-time host bootstrap)
 
-```bash
-sudo cp ops/nginx/armoryworks.com.conf /etc/nginx/sites-available/armoryworks.com.conf
-sudo ln -s /etc/nginx/sites-available/armoryworks.com.conf /etc/nginx/sites-enabled/   # if not already linked
-sudo nginx -t && sudo systemctl reload nginx
-```
+`setup-web.sh` installs the vhost, runs `nginx -t`, reloads, and (re-runs are idempotent) — same for the `armoryworks-writing-reload` systemd service and the UFW rule for the receiver port. You don't need to do any of these by hand. Cloudflare Tunnel ingress for `armoryworks.com` lives in `ops/cloudflared/config.yml` and is the one piece still wired separately (it's not container-side).
 
-The vhost terminates TLS with the Cloudflare Origin Cert, proxies `/` → `127.0.0.1:4203`, and serves the maintenance page (503) on any upstream-down window. Cloudflare Tunnel ingress for `armoryworks.com` lives in `ops/cloudflared/config.yml`.
+The vhost terminates TLS with the Cloudflare Origin Cert, proxies `/` → `127.0.0.1:4203`, and serves the maintenance page (503) on any upstream-down window.
 
 ## 6. Deploy / upgrade
 

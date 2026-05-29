@@ -227,8 +227,155 @@ sudo chown -R "$RECEIVER_UID":"$RECEIVER_UID" "$WRITING_DIR"
 sudo chmod -R a+rX "$WRITING_DIR"
 ok "Ownership: uid $RECEIVER_UID writes; UI nginx reads (world-readable)"
 
-info "Set WRITING_RECEIVER_TOKEN in .env (and the SAME value in the Tuyere"
-info "env on the API box) so tuyere-api can authenticate to the receiver."
+# ─────────────────────────────────────────────────────────────
+# 4d. Receiver bind + bearer token — auto-configure .env so the
+#     operator never edits it by hand.
+# ─────────────────────────────────────────────────────────────
+
+step "Configuring receiver bind + token in .env"
+
+DETECTED_LAN_IP=$(ip -4 -o addr show scope global 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | head -1 || true)
+if [[ -n "$DETECTED_LAN_IP" ]]; then
+    set_env WRITING_RECEIVER_BIND "$DETECTED_LAN_IP"
+    ok "WRITING_RECEIVER_BIND=$DETECTED_LAN_IP  (override in .env before re-running if multi-NIC)"
+else
+    warn "Couldn't auto-detect a LAN IP — set WRITING_RECEIVER_BIND in .env manually."
+fi
+
+CURRENT_TOKEN=$(get_env WRITING_RECEIVER_TOKEN)
+case "$CURRENT_TOKEN" in
+    ""|"change-me"*|"<paste"*|"PASTE"*)
+        NEW_TOKEN=$(openssl rand -hex 24)
+        set_env WRITING_RECEIVER_TOKEN "$NEW_TOKEN"
+        CURRENT_TOKEN="$NEW_TOKEN"
+        ok "Generated WRITING_RECEIVER_TOKEN"
+        ;;
+    *)
+        ok "Reusing existing WRITING_RECEIVER_TOKEN (set in .env)"
+        ;;
+esac
+
+RECEIVER_PORT=$(get_env WRITING_RECEIVER_PORT); RECEIVER_PORT=${RECEIVER_PORT:-5103}
+RECEIVER_URL="http://${DETECTED_LAN_IP:-<WEB-LAN-IP>}:${RECEIVER_PORT}"
+
+cat <<EOF
+
+═══════════════════════════════════════════════════════════════════════
+Paste THIS on the API box, in the tuyere-deploy directory, to wire
+tuyere-api to this receiver. Run it BEFORE \`./deploy.sh --role api\`.
+═══════════════════════════════════════════════════════════════════════
+
+  cat >> secrets/tuyere.env <<'AWT_RECEIVER'
+WRITING_RECEIVER_BASE_URL=$RECEIVER_URL
+WRITING_RECEIVER_TOKEN=$CURRENT_TOKEN
+AWT_RECEIVER
+
+═══════════════════════════════════════════════════════════════════════
+EOF
+
+# ─────────────────────────────────────────────────────────────
+# 4e. Host nginx vhost — install, validate, reload (idempotent)
+# ─────────────────────────────────────────────────────────────
+
+step "Installing host nginx vhost"
+
+VHOST_SRC="ops/nginx/armoryworks.com.conf"
+VHOST_TARGET=/etc/nginx/sites-available/armoryworks.com.conf
+VHOST_LINK=/etc/nginx/sites-enabled/armoryworks.com.conf
+
+if [[ ! -f "$VHOST_SRC" ]]; then
+    fail "missing $VHOST_SRC (did 'git pull' run in this repo?)"
+    exit 1
+fi
+if ! sudo cmp -s "$VHOST_SRC" "$VHOST_TARGET" 2>/dev/null; then
+    sudo install -m 0644 "$VHOST_SRC" "$VHOST_TARGET"
+    ok "Installed $VHOST_TARGET"
+else
+    ok "vhost already up to date"
+fi
+[[ -L "$VHOST_LINK" || -e "$VHOST_LINK" ]] || sudo ln -s "$VHOST_TARGET" "$VHOST_LINK"
+
+if sudo nginx -t >/dev/null 2>&1; then
+    sudo systemctl reload nginx
+    ok "nginx -t OK, reloaded"
+else
+    fail "nginx -t FAILED — fix the vhost before continuing"
+    sudo nginx -t
+    exit 1
+fi
+
+# ─────────────────────────────────────────────────────────────
+# 4f. writing-reload systemd service — install + enable
+# ─────────────────────────────────────────────────────────────
+
+step "Installing writing-reload systemd service"
+
+if ! command -v inotifywait >/dev/null 2>&1; then
+    info "inotify-tools not installed — installing"
+    sudo apt-get install -y inotify-tools
+fi
+
+REPO_DIR="$(cd "$(dirname "$0")" && pwd)"
+RELOAD_SH="$REPO_DIR/ops/writing-reload.sh"
+RELOAD_UNIT=/etc/systemd/system/armoryworks-writing-reload.service
+
+sudo chmod +x "$RELOAD_SH"
+
+WANT_UNIT=$(cat <<UNIT
+[Unit]
+Description=Reload nginx when the Tuyere writing redirect map changes
+After=nginx.service
+
+[Service]
+Environment=WRITING_CONTENT_DIR=$WRITING_DIR
+ExecStart=$RELOAD_SH
+Restart=always
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+)
+
+if [[ "$(sudo cat "$RELOAD_UNIT" 2>/dev/null || true)" != "$WANT_UNIT" ]]; then
+    echo "$WANT_UNIT" | sudo tee "$RELOAD_UNIT" >/dev/null
+    sudo systemctl daemon-reload
+    sudo systemctl enable --now armoryworks-writing-reload
+    ok "Installed + started armoryworks-writing-reload"
+else
+    sudo systemctl is-active --quiet armoryworks-writing-reload \
+        && ok "armoryworks-writing-reload already active" \
+        || { sudo systemctl enable --now armoryworks-writing-reload; ok "(Re)started armoryworks-writing-reload"; }
+fi
+
+# ─────────────────────────────────────────────────────────────
+# 4g. UFW — restrict the receiver port to the API box's source
+# ─────────────────────────────────────────────────────────────
+
+step "Configuring UFW for the receiver port"
+
+API_BOX_IP_ALLOW=$(get_env WRITING_RECEIVER_ALLOW_FROM)
+if [[ -n "$API_BOX_IP_ALLOW" ]] && command -v ufw >/dev/null 2>&1; then
+    sudo ufw allow from "$API_BOX_IP_ALLOW" to any port "$RECEIVER_PORT" proto tcp comment 'tuyere-writing-receiver' >/dev/null
+    ok "UFW: allow from $API_BOX_IP_ALLOW to port $RECEIVER_PORT"
+elif [[ -z "$API_BOX_IP_ALLOW" ]]; then
+    info "Set WRITING_RECEIVER_ALLOW_FROM=<api-box-ip> in .env to auto-install the UFW rule."
+else
+    warn "ufw not installed — skipping firewall rule"
+fi
+
+# ─────────────────────────────────────────────────────────────
+# 4h. Pull + bring up tuyere-writing-receiver
+# ─────────────────────────────────────────────────────────────
+
+step "Bringing up tuyere-writing-receiver"
+compose pull tuyere-writing-receiver
+compose up -d tuyere-writing-receiver
+sleep 1
+if curl -fsS "http://${DETECTED_LAN_IP:-127.0.0.1}:${RECEIVER_PORT}/health" >/dev/null 2>&1; then
+    ok "Receiver healthy at http://${DETECTED_LAN_IP:-127.0.0.1}:${RECEIVER_PORT}"
+else
+    warn "Receiver started but /health not responding yet — check 'docker logs tuyere-writing-receiver'"
+fi
 
 # ─────────────────────────────────────────────────────────────
 # 5. Start UI
