@@ -102,11 +102,20 @@ ok "GHCR credentials present"
 UI_PORT=$(get_env UI_PORT)
 UI_PORT=${UI_PORT:-4203}
 if ss -tlnp 2>/dev/null | grep -q ":${UI_PORT} "; then
-    warn "Port ${UI_PORT} (UI_PORT) is already in use on this host."
-    info "Stop the listener or change UI_PORT in .env, then re-run."
-    exit 1
+    # Tolerate the expected case on a re-run: the port is held by our own
+    # armory-works-ui container that an earlier deploy already brought up.
+    PORT_OCCUPANT=$(docker ps --filter "publish=${UI_PORT}" --format '{{.Names}}' 2>/dev/null | head -1)
+    if [[ "$PORT_OCCUPANT" == "armory-works-ui" ]]; then
+        ok "Port ${UI_PORT} held by the existing armory-works-ui container — leaving it"
+    else
+        warn "Port ${UI_PORT} (UI_PORT) is already in use on this host${PORT_OCCUPANT:+ (container '${PORT_OCCUPANT}')}."
+        info "Stop the listener or change UI_PORT in .env, then re-run."
+        info "Diagnostic:  sudo ss -tlnp 'sport = :${UI_PORT}'"
+        exit 1
+    fi
+else
+    ok "Port ${UI_PORT} (UI_PORT) is available"
 fi
-ok "Port ${UI_PORT} (UI_PORT) is available"
 
 if [[ ! -d "/etc/letsencrypt/live/armoryworks.com.cloudflare" ]]; then
     warn "No Cloudflare Origin Cert at /etc/letsencrypt/live/armoryworks.com.cloudflare/"
