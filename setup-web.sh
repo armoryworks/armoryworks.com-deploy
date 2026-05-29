@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# setup-web.sh — First-time setup for armoryworks-web (the Angular UI).
+# setup-web.sh — First-time setup for armoryworks-web (the static-site box).
 #
 # Run after ./scripts/install-aw-deploy.sh.
 #
@@ -9,11 +9,11 @@
 #   3. Bootstraps UI_IMAGE_TAG=latest if blank
 #   4. Warns if Cloudflare Origin Cert is missing
 #   5. Pulls the latest published armory-works-ui image from GHCR
-#   6. Brings up the UI container on 127.0.0.1:4203
+#   6. Creates + seeds the dynamic /writing content dir
+#   7. Brings up the UI container on 127.0.0.1:4203
 #
-# Host nginx terminates TLS with the Cloudflare Origin Cert and proxies:
-#   /     → 127.0.0.1:4203 (this UI container)
-#   /api/* → 192.168.1.198:8203 (.NET API on the api box)
+# Host nginx terminates TLS with the Cloudflare Origin Cert and proxies
+# / → 127.0.0.1:4203 (this UI container).
 #
 # Run from /opt/armoryworks-deploy:
 #   ./setup-web.sh
@@ -166,6 +166,51 @@ if [[ -f "ops/maintenance/maintenance.html" ]]; then
 else
     warn "ops/maintenance/maintenance.html not found — skipping"
 fi
+
+# ─────────────────────────────────────────────────────────────
+# 4c. Dynamic /writing content area (Tuyere writing CMS)
+# ─────────────────────────────────────────────────────────────
+
+step "Preparing dynamic /writing content dir"
+
+WRITING_DIR=$(get_env WRITING_CONTENT_DIR)
+WRITING_DIR=${WRITING_DIR:-/var/lib/armoryworks/writing}
+
+sudo mkdir -p "$WRITING_DIR"
+sudo chmod 0755 "$WRITING_DIR"
+ok "Content dir ready: $WRITING_DIR"
+
+# Seed a placeholder index so /writing/ serves a page before Tuyere publishes.
+# The bind mount shadows the image's baked /writing, so without this the dir
+# would be empty and /writing/ would 404. Tuyere overwrites this on publish.
+if [[ ! -e "$WRITING_DIR/index.html" ]]; then
+    sudo tee "$WRITING_DIR/index.html" >/dev/null <<'HTML'
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex">
+<title>Writing | Armory Works</title>
+<link rel="stylesheet" href="/css/armoryworks.css">
+</head>
+<body>
+<main class="container" style="padding:96px 0;">
+<h1>Writing</h1>
+<p>Operational notes are on the way.</p>
+</main>
+</body>
+</html>
+HTML
+    sudo chmod 0644 "$WRITING_DIR/index.html"
+    ok "Seeded placeholder /writing/index.html (Tuyere will overwrite it)"
+else
+    ok "/writing/index.html already present — leaving it"
+fi
+
+info "Tuyere (co-hosted) needs WRITE access to $WRITING_DIR; the UI container"
+info "mounts it read-only. Grant Tuyere's service user/group write when you"
+info "wire up the Tuyere side."
 
 # ─────────────────────────────────────────────────────────────
 # 5. Start UI

@@ -2,6 +2,14 @@
 
 Notable changes to `armoryworks.com-deploy`. Format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/). Versions track the `aw-deploy` CLI.
 
+## [Unreleased]
+
+### Added
+- Dynamic `/writing` content area: a host dir (`WRITING_CONTENT_DIR`, default `/var/lib/armoryworks/writing`) bind-mounted **read-only** into the UI container at `/usr/share/nginx/html/writing`, for the co-hosted Tuyere writing CMS to render posts + index + `feed.xml` into. Serving stays pure-static (nginx reads files; never calls Tuyere). `setup-web.sh` creates + seeds the dir with a placeholder index (the mount shadows the image's baked `/writing`). See `docs/DEPLOY.md` §6b.
+
+### Changed
+- `docker-compose.web.yml`, `.env.web.example`, `setup-web.sh` — dropped stale Angular-/api-box header comments now that this box is static-site only.
+
 ## [0.2.0] — 2026-05-28
 
 Static collapse + convergence to the shared AWT deploy conventions (`forge-deploy` is the reference; see the source repo's `docs/deploy-conventions.md`). armoryworks.com is now a single static service, so the api/web split is gone.

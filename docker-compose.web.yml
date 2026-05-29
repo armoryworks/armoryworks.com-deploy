@@ -1,5 +1,6 @@
 # Production compose for armoryworks-web (KAMRUI).
-# Runs the Angular UI only — the .NET API + DB live on armoryworks-api.
+# Serves the armoryworks.com static site (Eleventy → nginx). No API, no DB —
+# the only dynamic input is the bind-mounted /writing content (see volumes).
 #
 # Image source: GHCR (ghcr.io/armoryworks/armory-works-ui). Images are built
 # + pushed by the .github/workflows/release-ui.yml workflow in the
@@ -10,12 +11,8 @@
 #   aw-deploy <tag>              # operator-driven deploy + healthcheck rollback
 #   docker compose -f docker-compose.web.yml up -d    # straight compose (rarely)
 #
-# Host nginx on this box terminates TLS with the Cloudflare Origin Cert
-# and routes:
-#   /                      → http://127.0.0.1:4203 (this UI container)
-#   /api/*                 → http://192.168.1.198:8203 (.NET API on api box)
-#   /signin-oidc           → http://192.168.1.198:8203 (OIDC callback)
-#   /signout-callback-oidc → http://192.168.1.198:8203
+# Host nginx on this box terminates TLS with the Cloudflare Origin Cert and
+# routes / → http://127.0.0.1:4203 (this UI container).
 
 name: armory-works-web
 
@@ -34,3 +31,13 @@ services:
       # listened on 8080 — that mismatch surfaced as a 502 behind host nginx
       # even though the container's own healthcheck passed.
       - "127.0.0.1:${UI_PORT:-4203}:80"
+    volumes:
+      # Dynamic /writing area. The co-hosted Tuyere "writing CMS" renders post
+      # HTML + the /writing index + feed.xml into this host dir; nginx serves
+      # them read-only at their own clean URLs. Empty until Tuyere publishes
+      # (setup-web.sh seeds a placeholder index so /writing/ never 404s).
+      #
+      # This keeps the live site PURE-STATIC: serving reads files off disk and
+      # never calls Tuyere at request time. The mount shadows the image's baked
+      # /writing — once Tuyere is live, the Eleventy /writing pipeline retires.
+      - "${WRITING_CONTENT_DIR:-/var/lib/armoryworks/writing}:/usr/share/nginx/html/writing:ro"

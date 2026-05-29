@@ -60,6 +60,15 @@ aw-deploy --self-update   # git pull + reinstall the CLI
 
 The health gate curls the **host-published port** (`127.0.0.1:UI_PORT/`), not just the container's internal healthcheck — so a port/upstream misconfig fails the gate and rolls back instead of reporting a false "healthy."
 
+## 6b. Dynamic `/writing` content
+
+`/writing` is served from a host dir bind-mounted **read-only** into the UI container at `/usr/share/nginx/html/writing` (env `WRITING_CONTENT_DIR`, default `/var/lib/armoryworks/writing`). The co-hosted Tuyere "writing CMS" renders post HTML + the `/writing` index + `feed.xml` into it; nginx serves them as plain files. The live site stays pure-static — nginx never calls Tuyere at request time, so published posts keep serving even if Tuyere is down.
+
+- `setup-web.sh` creates the dir and seeds a placeholder `index.html` so `/writing/` doesn't 404 before Tuyere publishes. The bind mount **shadows** the image's baked `/writing`, so the seed (or Tuyere's output) is required.
+- **Rollout note:** on an existing box, re-run `./setup-web.sh` (or pre-create + seed the dir) before deploying an image built with this compose change — otherwise the empty auto-created mount makes `/writing/` 404 until Tuyere publishes.
+- Tuyere needs **write** access to `WRITING_CONTENT_DIR`; the UI container only reads it. Sort out ownership when wiring the Tuyere side (shared user/group).
+- Slug moves/removals (301/410) are **not** wired yet — that's part of the Tuyere build (nginx-reload coordination TBD).
+
 ## 7. Co-host port map
 
 This box runs three stacks; each container binds a distinct `127.0.0.1` port and host nginx routes by hostname:
