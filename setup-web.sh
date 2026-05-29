@@ -155,6 +155,76 @@ if [[ -z "$CURRENT_TAG" ]]; then
 fi
 
 # ─────────────────────────────────────────────────────────────
+# 3b. Receiver bind + bearer token — set BEFORE any `compose` call,
+#     because docker compose validates the WHOLE file (including the
+#     ${WRITING_RECEIVER_TOKEN:?} on tuyere-writing-receiver) even when
+#     you only act on one service.
+# ─────────────────────────────────────────────────────────────
+
+step "Configuring receiver bind + token in .env"
+
+DETECTED_LAN_IP=$(ip -4 -o addr show scope global 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | head -1 || true)
+
+# Bind: env var > existing non-default .env value > auto-detected LAN IP.
+if [[ -n "${WRITING_RECEIVER_BIND:-}" ]]; then
+    set_env WRITING_RECEIVER_BIND "$WRITING_RECEIVER_BIND"
+    ok "WRITING_RECEIVER_BIND=$WRITING_RECEIVER_BIND (from environment)"
+else
+    CURRENT_BIND=$(get_env WRITING_RECEIVER_BIND)
+    if [[ -z "$CURRENT_BIND" || "$CURRENT_BIND" == "127.0.0.1" ]]; then
+        if [[ -n "$DETECTED_LAN_IP" ]]; then
+            set_env WRITING_RECEIVER_BIND "$DETECTED_LAN_IP"
+            ok "WRITING_RECEIVER_BIND=$DETECTED_LAN_IP (auto-detected)"
+        else
+            warn "Couldn't auto-detect a LAN IP — set WRITING_RECEIVER_BIND in .env manually."
+        fi
+    else
+        ok "WRITING_RECEIVER_BIND=$CURRENT_BIND (preserving .env value)"
+    fi
+fi
+
+# Token: env var > existing non-placeholder .env > interactive prompt > generate.
+is_placeholder_token() {
+    case "$1" in
+        ""|"change-me"*|"<paste"*|"PASTE"*) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+ENV_TOKEN="${WRITING_RECEIVER_TOKEN:-}"
+EXISTING_TOKEN=$(get_env WRITING_RECEIVER_TOKEN)
+
+if [[ -n "$ENV_TOKEN" ]] && ! is_placeholder_token "$ENV_TOKEN"; then
+    set_env WRITING_RECEIVER_TOKEN "$ENV_TOKEN"
+    CURRENT_TOKEN="$ENV_TOKEN"
+    ok "WRITING_RECEIVER_TOKEN: using value from environment"
+elif ! is_placeholder_token "$EXISTING_TOKEN"; then
+    CURRENT_TOKEN="$EXISTING_TOKEN"
+    ok "WRITING_RECEIVER_TOKEN: reusing value already in .env"
+elif [[ -t 0 ]]; then
+    echo ""
+    info "WRITING_RECEIVER_TOKEN is the shared bearer tuyere-api uses to authenticate"
+    info "to the receiver. It must match the value on the API box (paste it on both)."
+    read -r -p "    Paste an existing token, or press Enter to auto-generate: " ENTERED_TOKEN
+    if [[ -n "$ENTERED_TOKEN" ]]; then
+        CURRENT_TOKEN="$ENTERED_TOKEN"
+        set_env WRITING_RECEIVER_TOKEN "$CURRENT_TOKEN"
+        ok "WRITING_RECEIVER_TOKEN: saved your pasted value to .env"
+    else
+        CURRENT_TOKEN=$(openssl rand -hex 24)
+        set_env WRITING_RECEIVER_TOKEN "$CURRENT_TOKEN"
+        ok "WRITING_RECEIVER_TOKEN: generated a new value"
+    fi
+else
+    CURRENT_TOKEN=$(openssl rand -hex 24)
+    set_env WRITING_RECEIVER_TOKEN "$CURRENT_TOKEN"
+    ok "WRITING_RECEIVER_TOKEN: generated a new value (no TTY for prompt)"
+fi
+
+RECEIVER_PORT=$(get_env WRITING_RECEIVER_PORT); RECEIVER_PORT=${RECEIVER_PORT:-5103}
+RECEIVER_URL="http://${DETECTED_LAN_IP:-<WEB-LAN-IP>}:${RECEIVER_PORT}"
+
+# ─────────────────────────────────────────────────────────────
 # 4. Pull image
 # ─────────────────────────────────────────────────────────────
 
@@ -235,52 +305,6 @@ RECEIVER_UID="${WRITING_RECEIVER_UID:-1654}"
 sudo chown -R "$RECEIVER_UID":"$RECEIVER_UID" "$WRITING_DIR"
 sudo chmod -R a+rX "$WRITING_DIR"
 ok "Ownership: uid $RECEIVER_UID writes; UI nginx reads (world-readable)"
-
-# ─────────────────────────────────────────────────────────────
-# 4d. Receiver bind + bearer token — auto-configure .env so the
-#     operator never edits it by hand.
-# ─────────────────────────────────────────────────────────────
-
-step "Configuring receiver bind + token in .env"
-
-DETECTED_LAN_IP=$(ip -4 -o addr show scope global 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | head -1 || true)
-if [[ -n "$DETECTED_LAN_IP" ]]; then
-    set_env WRITING_RECEIVER_BIND "$DETECTED_LAN_IP"
-    ok "WRITING_RECEIVER_BIND=$DETECTED_LAN_IP  (override in .env before re-running if multi-NIC)"
-else
-    warn "Couldn't auto-detect a LAN IP — set WRITING_RECEIVER_BIND in .env manually."
-fi
-
-CURRENT_TOKEN=$(get_env WRITING_RECEIVER_TOKEN)
-case "$CURRENT_TOKEN" in
-    ""|"change-me"*|"<paste"*|"PASTE"*)
-        NEW_TOKEN=$(openssl rand -hex 24)
-        set_env WRITING_RECEIVER_TOKEN "$NEW_TOKEN"
-        CURRENT_TOKEN="$NEW_TOKEN"
-        ok "Generated WRITING_RECEIVER_TOKEN"
-        ;;
-    *)
-        ok "Reusing existing WRITING_RECEIVER_TOKEN (set in .env)"
-        ;;
-esac
-
-RECEIVER_PORT=$(get_env WRITING_RECEIVER_PORT); RECEIVER_PORT=${RECEIVER_PORT:-5103}
-RECEIVER_URL="http://${DETECTED_LAN_IP:-<WEB-LAN-IP>}:${RECEIVER_PORT}"
-
-cat <<EOF
-
-═══════════════════════════════════════════════════════════════════════
-Paste THIS on the API box, in the tuyere-deploy directory, to wire
-tuyere-api to this receiver. Run it BEFORE \`./deploy.sh --role api\`.
-═══════════════════════════════════════════════════════════════════════
-
-  cat >> secrets/tuyere.env <<'AWT_RECEIVER'
-WRITING_RECEIVER_BASE_URL=$RECEIVER_URL
-WRITING_RECEIVER_TOKEN=$CURRENT_TOKEN
-AWT_RECEIVER
-
-═══════════════════════════════════════════════════════════════════════
-EOF
 
 # ─────────────────────────────────────────────────────────────
 # 4e. Host nginx vhost — install, validate, reload (idempotent)
@@ -389,6 +413,21 @@ if curl -fsS "http://${DETECTED_LAN_IP:-127.0.0.1}:${RECEIVER_PORT}/health" >/de
 else
     warn "Receiver started but /health not responding yet — check 'docker logs tuyere-writing-receiver'"
 fi
+
+cat <<EOF
+
+═══════════════════════════════════════════════════════════════════════
+Paste THIS on the API box, in the tuyere-deploy directory, to wire
+tuyere-api to this receiver. Run it BEFORE \`./deploy.sh --role api\`.
+═══════════════════════════════════════════════════════════════════════
+
+  cat >> secrets/tuyere.env <<'AWT_RECEIVER'
+WRITING_RECEIVER_BASE_URL=$RECEIVER_URL
+WRITING_RECEIVER_TOKEN=$CURRENT_TOKEN
+AWT_RECEIVER
+
+═══════════════════════════════════════════════════════════════════════
+EOF
 
 # ─────────────────────────────────────────────────────────────
 # 5. Start UI
