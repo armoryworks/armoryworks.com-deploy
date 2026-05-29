@@ -353,6 +353,10 @@ fi
 
 step "Configuring UFW for the receiver port"
 
+# Env var takes precedence over .env, then persists to .env for future runs.
+if [[ -n "${WRITING_RECEIVER_ALLOW_FROM:-}" ]]; then
+    set_env WRITING_RECEIVER_ALLOW_FROM "$WRITING_RECEIVER_ALLOW_FROM"
+fi
 API_BOX_IP_ALLOW=$(get_env WRITING_RECEIVER_ALLOW_FROM)
 if [[ -n "$API_BOX_IP_ALLOW" ]] && command -v ufw >/dev/null 2>&1; then
     sudo ufw allow from "$API_BOX_IP_ALLOW" to any port "$RECEIVER_PORT" proto tcp comment 'tuyere-writing-receiver' >/dev/null
