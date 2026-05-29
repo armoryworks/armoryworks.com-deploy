@@ -431,6 +431,64 @@ AWT_RECEIVER
 EOF
 
 # ─────────────────────────────────────────────────────────────
+# 4j. Cloudflared tunnel ingress for tuyere.armoryworks.com
+#     (idempotent: skips if already wired; YAML-edited, not sed-hacked)
+# ─────────────────────────────────────────────────────────────
+
+step "Wiring cloudflared ingress for tuyere.armoryworks.com"
+
+if ! command -v cloudflared >/dev/null 2>&1; then
+    warn "cloudflared not installed on this host — skipping tunnel automation"
+else
+    CFD_CONFIG=""
+    for c in /etc/cloudflared/config.yml /etc/cloudflared/config.yaml \
+             "$(cd "$(dirname "$0")" && pwd)/ops/cloudflared/config.yml" \
+             "$HOME/.cloudflared/config.yml"; do
+        [[ -f "$c" ]] && { CFD_CONFIG="$c"; break; }
+    done
+
+    if [[ -z "$CFD_CONFIG" ]]; then
+        warn "cloudflared config not found in /etc/cloudflared/, ops/cloudflared/, or ~/.cloudflared/ — add the tuyere.armoryworks.com ingress manually"
+    elif sudo grep -q 'tuyere\.armoryworks\.com' "$CFD_CONFIG"; then
+        ok "cloudflared ingress already includes tuyere.armoryworks.com ($CFD_CONFIG)"
+    else
+        # Need a YAML-aware editor. Prefer yq; fall back to python3 + PyYAML.
+        if ! command -v yq >/dev/null 2>&1 && ! python3 -c "import yaml" 2>/dev/null; then
+            info "Installing python3-yaml for safe YAML editing"
+            sudo apt-get install -y python3-yaml >/dev/null
+        fi
+        if command -v yq >/dev/null 2>&1; then
+            sudo yq -i '.ingress = [{"hostname":"tuyere.armoryworks.com","service":"https://127.0.0.1:443","originRequest":{"noTLSVerify":true}}] + (.ingress // [])' "$CFD_CONFIG"
+        else
+            sudo python3 - "$CFD_CONFIG" <<'PY'
+import yaml, sys
+p = sys.argv[1]
+with open(p) as f: cfg = yaml.safe_load(f) or {}
+ingress = cfg.setdefault('ingress', [])
+ingress.insert(0, {'hostname': 'tuyere.armoryworks.com', 'service': 'https://127.0.0.1:443', 'originRequest': {'noTLSVerify': True}})
+with open(p, 'w') as f: yaml.safe_dump(cfg, f, default_flow_style=False, sort_keys=False)
+PY
+        fi
+        ok "added tuyere.armoryworks.com ingress to $CFD_CONFIG"
+    fi
+
+    # DNS route — cloudflared itself is idempotent here.
+    TUNNEL_NAME=$(sudo grep -E '^tunnel:' "$CFD_CONFIG" 2>/dev/null | awk '{print $2}' | tr -d '"' | head -1 || echo "")
+    if [[ -n "$TUNNEL_NAME" ]]; then
+        if sudo cloudflared tunnel route dns "$TUNNEL_NAME" tuyere.armoryworks.com >/dev/null 2>&1 \
+           || cloudflared tunnel route dns "$TUNNEL_NAME" tuyere.armoryworks.com >/dev/null 2>&1; then
+            ok "DNS route ensured: tuyere.armoryworks.com -> $TUNNEL_NAME"
+        else
+            warn "cloudflared DNS route command failed — run manually: cloudflared tunnel route dns $TUNNEL_NAME tuyere.armoryworks.com"
+        fi
+    fi
+
+    if systemctl is-active --quiet cloudflared 2>/dev/null; then
+        sudo systemctl restart cloudflared && ok "cloudflared restarted"
+    fi
+fi
+
+# ─────────────────────────────────────────────────────────────
 # 5. Start UI
 # ─────────────────────────────────────────────────────────────
 
