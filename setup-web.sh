@@ -514,8 +514,11 @@ CONF
     [[ -L "$TUYERE_VHOST_LINK" || -e "$TUYERE_VHOST_LINK" ]] || sudo ln -s "$TUYERE_VHOST_TARGET" "$TUYERE_VHOST_LINK"
 
     if sudo nginx -t >/dev/null 2>&1; then
-        sudo systemctl reload nginx
-        ok "nginx -t OK, reloaded"
+        # `reload` (SIGHUP) sometimes won't replace workers when a NEW
+        # server_name on an existing listen address is added; full restart
+        # guarantees the new server block is live.
+        sudo systemctl restart nginx
+        ok "nginx -t OK, restarted (new server block requires restart, not reload)"
     else
         fail "nginx -t FAILED on tuyere vhost"
         sudo nginx -t
