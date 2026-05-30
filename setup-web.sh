@@ -493,6 +493,12 @@ server {
         proxy_set_header X-Real-IP         \$remote_addr;
         proxy_set_header X-Forwarded-For   \$proxy_add_x_forwarded_for;
         proxy_set_header X-Forwarded-Proto \$scheme;
+
+        # OIDC callback returns a 302 with a DataProtection-encrypted aw.auth
+        # cookie that easily exceeds the default 4 KB proxy header buffer.
+        proxy_buffer_size           16k;
+        proxy_buffers               8 16k;
+        proxy_busy_buffers_size     32k;
     }
 
     location / {
