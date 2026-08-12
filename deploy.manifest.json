@@ -1,0 +1,19 @@
+{
+  "$comment": "Stack manifest for aw-deploy (>= 0.3.0). One component per compose file; a component's services version in lockstep (one CI build tags all its images identically). A component is managed on a box iff a .env exists next to its compose file. tuyere-writing-receiver is deliberately absent: it pins an 'edge' tag outside the release-tag discipline and is managed via 'aw-deploy compose'.",
+  "stack": "aw",
+  "registry": { "host": "ghcr.io", "owner": "armoryworks" },
+  "components": [
+    {
+      "key": "site",
+      "compose_file": "docker-compose.web.yml",
+      "services": [
+        {
+          "name": "armory-works-ui",
+          "image": "armory-works-ui",
+          "tag_var": "UI_IMAGE_TAG",
+          "health": { "port_var": "UI_PORT", "port_default": 4203, "path": "/" }
+        }
+      ]
+    }
+  ]
+}

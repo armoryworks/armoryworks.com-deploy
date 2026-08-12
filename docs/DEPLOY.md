@@ -42,6 +42,8 @@ The vhost terminates TLS with the Cloudflare Origin Cert, proxies `/` → `127.0
 
 ## 6. Deploy / upgrade
 
+Since `aw-deploy` 0.3.0 the CLI is stack-agnostic: it reads `deploy.manifest.json` from the deploy repo it's pointed at (`-r <path>`, default this repo), so the one installed binary also drives other product stacks (e.g. `aw-deploy -r /opt/nommeal-deploy nom v0.1.2`). For this stack nothing changes — the site is the manifest's sole component, so the bare forms below still work:
+
 ```bash
 aw-preflight              # read-only GO/NO-GO check before deploying
 aw-deploy --list          # see recent published versions

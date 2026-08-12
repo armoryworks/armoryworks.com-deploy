@@ -1,16 +1,20 @@
 #!/usr/bin/env bash
-# aw-deploy — Operator-driven deploy CLI for armoryworks.com.
+# aw-deploy — Operator-driven deploy CLI for ArmoryWorks product stacks.
 #
-# armoryworks.com is a single static site: one container (the nginx image
-# built from the source repo), one box. This CLI pulls the image from
-# ghcr.io/armoryworks/armory-works-ui, pins UI_IMAGE_TAG in .env, recreates
-# the container, and gates on a host-PUBLISHED-port health check with
-# rollback. State + log retained on the host.
+# Stack-agnostic since 0.3.0: everything product-specific lives in a
+# `deploy.manifest.json` at the root of each *-deploy repo (armoryworks.com,
+# nommeal, ...). The CLI reads the manifest, verifies the requested tag in
+# GHCR, pins the component's tag vars in the .env next to its compose file,
+# recreates only the manifest-listed services, and gates on host-published
+# port health checks with rollback. State + log retained on the host.
+#
+# A "component" is one compose file's worth of services that version in
+# lockstep (one CI build tags all its images identically). A component is
+# managed ON THIS BOX iff a .env exists next to its compose file — that's
+# the setup marker each box's runbook creates.
 #
 # Conventions shared with forge-deploy (the reference) — see the source repo's
-# docs/deploy-conventions.md. armoryworks.com implements only the trivial
-# single-service slice: no topology wizard, no component scope, no DB /
-# migrations / profiles.
+# docs/deploy-conventions.md.
 #
 # Bash conventions: set -euo pipefail · quote everything · [[ ]] over [ ] ·
 # never deploys 'latest'.
@@ -21,35 +25,27 @@ set -euo pipefail
 # Constants
 # ─────────────────────────────────────────────────────────────
 
-readonly AW_DEPLOY_VERSION="0.2.0"
-readonly REPO_ROOT="${AW_DEPLOY_REPO:-/opt/armoryworks-deploy}"
-readonly STATE_DIR="/etc/armoryworks"
+readonly AW_DEPLOY_VERSION="0.3.0"
+
+# Where THIS TOOL lives (for --self-update). Independent of --repo, which
+# selects the stack being deployed.
+readonly TOOL_HOME="${AW_TOOL_HOME:-/opt/armoryworks-deploy}"
+
+readonly STATE_DIR="${AW_STATE_DIR:-/etc/armoryworks}"
 readonly STATE_FILE="${STATE_DIR}/deploy-state.json"
-readonly LOG_FILE="/var/log/aw-deploy.log"
-readonly ENV_FILE="${REPO_ROOT}/.env"
-readonly COMPOSE_WEB="${REPO_ROOT}/docker-compose.web.yml"
-readonly REGISTRY_HOST="ghcr.io"
-readonly REGISTRY_OWNER="armoryworks"
+readonly LOG_FILE="${AW_LOG_FILE:-/var/log/aw-deploy.log}"
 
-# The one service. armoryworks.com is a single static container.
-readonly IMAGE_REPO="armory-works-ui"
-readonly IMAGE_ENVVAR="UI_IMAGE_TAG"
-readonly COMPOSE_SERVICE="armory-works-ui"
-readonly HEALTH_PATH="/"          # static site root returns 200 when healthy
-
-# Max seconds to wait for the published port to answer before rolling back.
-# Override per host via .env (HEALTHCHECK_TIMEOUT_SECS=...) or a shell env var.
 readonly HEALTHCHECK_TIMEOUT_DEFAULT=120
 readonly HEALTHCHECK_POLL_INTERVAL=3
 
-# GHCR auth: PAT with read:packages scope (the package is private).
-# install-aw-deploy.sh writes these.
+# GHCR auth: PAT with read:packages scope. install-aw-deploy.sh writes these.
 readonly GHCR_USER_FILE="${STATE_DIR}/ghcr-user"
 readonly GHCR_TOKEN_FILE="${STATE_DIR}/ghcr-token"
 
-# Tag format regexes
-readonly TAG_RE_SHA='^main-[a-f0-9]{7,40}$'
-readonly TAG_RE_SEMVER='^[0-9]+\.[0-9]+\.[0-9]+$'
+# Default accepted tag shapes (a manifest may override via "tagPatterns"):
+# X.Y.Z / vX.Y.Z release tags, and main-<sha> / sha-<sha> build tags.
+readonly TAG_RE_DEFAULT_SEMVER='^v?[0-9]+\.[0-9]+\.[0-9]+$'
+readonly TAG_RE_DEFAULT_SHA='^(main|sha)-[a-f0-9]{7,40}$'
 
 # ─────────────────────────────────────────────────────────────
 # Color output (respects NO_COLOR)
@@ -79,38 +75,146 @@ die()  { err "$1"; exit "${2:-1}"; }
 
 usage() {
   cat <<EOF
-aw-deploy ${AW_DEPLOY_VERSION} — armoryworks.com deploy CLI
+aw-deploy ${AW_DEPLOY_VERSION} — ArmoryWorks stack deploy CLI
 
 USAGE:
-  aw-deploy                  Interactive: pick a recent version, deploy it
-  aw-deploy <tag>            Deploy a specific tag (semver X.Y.Z or main-<sha>)
-  aw-deploy --up             Bring the container up on the currently pinned tag
-  aw-deploy compose <args>   Scope-aware 'docker compose' passthrough (use this,
-                             not bare docker compose)
-  aw-deploy --list           List recent X.Y.Z versions in GHCR
-  aw-deploy --list --builds  List recent main-<sha> build tags instead
-  aw-deploy --status         Show deployed version + container health
-  aw-deploy --rollback       Re-pin to the previously deployed version
+  aw-deploy [-r <repo>] [<component>] <tag>
+                             Deploy a tag. <component> may be omitted when the
+                             manifest has exactly one component managed on this
+                             box (a .env next to its compose file).
+  aw-deploy [-r <repo>]      Interactive: pick a recent version, deploy it
+                             (single managed component only)
+  aw-deploy --up [<component>]
+                             Bring services up on the currently pinned tag
+  aw-deploy compose [<component>] <args>
+                             Scope-aware 'docker compose' passthrough (use
+                             this, not bare docker compose)
+  aw-deploy --list           List recent release tags in GHCR per image
+  aw-deploy --list --builds  List recent build tags (main-/sha-<sha>) instead
+  aw-deploy --status         Show deployed versions + container health
+  aw-deploy --rollback [<component>]
+                             Re-pin to the previously deployed version
   aw-deploy --logs           Tail the deploy history log
-  aw-deploy --self-update    git pull this repo + reinstall the CLI
+  aw-deploy --self-update    git pull the tool repo + reinstall the CLI
   aw-deploy --help           This usage
 
+REPO SELECTION:
+  -r, --repo <path>          Deploy repo to operate on. Defaults to
+                             \$AW_DEPLOY_REPO, then /opt/armoryworks-deploy.
+                             The repo must contain deploy.manifest.json.
+
 EXAMPLES:
-  aw-deploy 0.1.11           Deploy that version
-  aw-deploy main-c3f04bc     Deploy a specific build SHA
-  aw-deploy --up             Recreate on the pinned tag (e.g. after a compose edit)
+  aw-deploy 0.1.11                         armoryworks.com site (sole component)
+  aw-deploy -r /opt/nommeal-deploy nom v0.1.2      NOM app on the api box
+  aw-deploy -r /opt/nommeal-deploy site main-c3f04bc   nommeal.com site
+  aw-deploy -r /opt/nommeal-deploy compose nom logs -f nom-api
 
 NOTES:
-  * Single static service (armory-works-ui). One container, one box.
-  * Both X.Y.Z versions and main-<sha> tags are accepted; 'latest' is refused.
-  * Health gate curls the host-published port (127.0.0.1:UI_PORT/), not just
-    the container's internal healthcheck.
-  * State: ${STATE_FILE}   Log: ${LOG_FILE}   Repo: ${REPO_ROOT}
+  * Components version in lockstep: one tag pins every image the component
+    lists in the manifest. 'latest' is always refused.
+  * Health gate curls each service's host-published port, not just the
+    container's internal healthcheck.
+  * State: ${STATE_FILE}   Log: ${LOG_FILE}
 EOF
 }
 
 # ─────────────────────────────────────────────────────────────
-# Pre-flight (inline guards; see scripts/aw-preflight for the full doctor)
+# Manifest loading
+#
+# deploy.manifest.json shape (see docs/deploy-conventions.md):
+#   {
+#     "stack": "nommeal",
+#     "registry": {"host": "ghcr.io", "owner": "armoryworks"},
+#     "tagPatterns": ["^v?[0-9]+..."],          // optional override
+#     "components": [
+#       { "key": "nom", "compose_file": "api-box/docker-compose.nom.yml",
+#         "services": [
+#           { "name": "nom-api", "image": "nom-api", "tag_var": "API_IMAGE_TAG",
+#             "health": {"port_var": "API_PORT", "port_default": 8206,
+#                        "path": "/health"} } ] } ]
+#   }
+# ─────────────────────────────────────────────────────────────
+
+REPO_ROOT=""
+MANIFEST=""
+STACK=""
+REGISTRY_HOST=""
+REGISTRY_OWNER=""
+
+load_manifest() {
+  MANIFEST="${REPO_ROOT}/deploy.manifest.json"
+  [[ -f "$MANIFEST" ]] || die "No deploy.manifest.json in ${REPO_ROOT} (wrong --repo? pre-0.3.0 checkout?)"
+  jq -e . "$MANIFEST" >/dev/null 2>&1 || die "deploy.manifest.json is not valid JSON: $MANIFEST"
+  STACK=$(jq -r '.stack // empty' "$MANIFEST")
+  [[ -n "$STACK" ]] || die "Manifest missing required field: stack"
+  REGISTRY_HOST=$(jq -r '.registry.host // "ghcr.io"' "$MANIFEST")
+  REGISTRY_OWNER=$(jq -r '.registry.owner // empty' "$MANIFEST")
+  [[ -n "$REGISTRY_OWNER" ]] || die "Manifest missing required field: registry.owner"
+  jq -e '.components | type == "array" and length > 0' "$MANIFEST" >/dev/null \
+    || die "Manifest needs a non-empty components array"
+}
+
+# All component keys in the manifest.
+manifest_components() { jq -r '.components[].key' "$MANIFEST"; }
+
+comp_exists() { jq -e --arg k "$1" '.components[] | select(.key == $k)' "$MANIFEST" >/dev/null; }
+
+comp_compose_file() {
+  local rel
+  rel=$(jq -r --arg k "$1" '.components[] | select(.key == $k) | .compose_file' "$MANIFEST")
+  printf '%s/%s' "$REPO_ROOT" "$rel"
+}
+
+# The component's .env lives next to its compose file. Its presence is the
+# "this box runs this component" marker.
+comp_env_file() {
+  local cf
+  cf=$(comp_compose_file "$1")
+  printf '%s/.env' "$(dirname "$cf")"
+}
+
+comp_managed() { [[ -f "$(comp_env_file "$1")" ]]; }
+
+managed_components() {
+  local k
+  while IFS= read -r k; do
+    comp_managed "$k" && printf '%s\n' "$k"
+  done < <(manifest_components)
+  return 0
+}
+
+# Service records for a component: one per line, |-separated:
+#   name|image|tag_var|port_var|port_default|health_path
+comp_services() {
+  jq -r --arg k "$1" '
+    .components[] | select(.key == $k) | .services[] |
+    [.name, .image, .tag_var,
+     (.health.port_var // ""), (.health.port_default // "" | tostring),
+     (.health.path // "/")] | join("|")' "$MANIFEST"
+}
+
+comp_service_names() { comp_services "$1" | cut -d'|' -f1; }
+
+# Resolve the target component from an optional CLI arg: explicit key wins;
+# otherwise the sole managed component; ambiguity is an error with a hint.
+resolve_component() {
+  local requested="${1:-}" managed
+  if [[ -n "$requested" ]]; then
+    comp_exists "$requested" || die "Unknown component '$requested' (manifest has: $(manifest_components | paste -sd', ' -))"
+    comp_managed "$requested" || die "Component '$requested' is not set up on this box (no .env at $(dirname "$(comp_compose_file "$requested")"))"
+    printf '%s\n' "$requested"
+    return
+  fi
+  managed=$(managed_components)
+  [[ -n "$managed" ]] || die "No components are set up on this box (no .env next to any manifest compose file)"
+  if [[ $(printf '%s\n' "$managed" | wc -l) -gt 1 ]]; then
+    die "Multiple components managed here ($(printf '%s' "$managed" | paste -sd', ' -)) — name one: aw-deploy <component> <tag>"
+  fi
+  printf '%s\n' "$managed"
+}
+
+# ─────────────────────────────────────────────────────────────
+# Pre-flight
 # ─────────────────────────────────────────────────────────────
 
 require_cmd() {
@@ -122,9 +226,7 @@ preflight() {
   require_cmd curl
   require_cmd jq
   docker compose version >/dev/null 2>&1 || die "docker compose plugin missing"
-
-  [[ -f "$COMPOSE_WEB" ]] || die "Compose file not found: $COMPOSE_WEB (set AW_DEPLOY_REPO?)"
-  [[ -f "$ENV_FILE" ]]    || die "Env file not found: $ENV_FILE (run setup-web.sh first)"
+  load_manifest
   [[ -f "$STATE_FILE" ]]  || die "State file not found: $STATE_FILE (run scripts/install-aw-deploy.sh)"
   [[ -w "$STATE_FILE" ]]  || die "State file not writable: $STATE_FILE"
   [[ -w "$LOG_FILE" ]]    || die "Log file not writable: $LOG_FILE"
@@ -133,22 +235,38 @@ preflight() {
   fi
 }
 
+# Per-component guards, run after resolve_component.
+preflight_component() {
+  local comp="$1" cf ef
+  cf=$(comp_compose_file "$comp")
+  ef=$(comp_env_file "$comp")
+  [[ -f "$cf" ]] || die "Compose file not found: $cf"
+  [[ -f "$ef" ]] || die "Env file not found: $ef"
+  [[ -w "$ef" ]] || die "Env file not writable: $ef"
+}
+
 # ─────────────────────────────────────────────────────────────
 # Tag validation
 # ─────────────────────────────────────────────────────────────
 
 validate_tag() {
-  local tag="$1"
+  local tag="$1" pat matched=0
   if [[ "$tag" == "latest" ]]; then
-    die "Refusing to deploy 'latest' — pass a main-<sha> or <X.Y.Z> tag (try: aw-deploy --list)"
+    die "Refusing to deploy 'latest' — pass an immutable tag (try: aw-deploy --list)"
   fi
-  if [[ ! "$tag" =~ $TAG_RE_SHA ]] && [[ ! "$tag" =~ $TAG_RE_SEMVER ]]; then
-    die "Invalid tag format: '$tag' (expected main-<hex> or X.Y.Z)"
+  if jq -e '.tagPatterns | type == "array" and length > 0' "$MANIFEST" >/dev/null 2>&1; then
+    while IFS= read -r pat; do
+      [[ "$tag" =~ $pat ]] && matched=1
+    done < <(jq -r '.tagPatterns[]' "$MANIFEST")
+  else
+    [[ "$tag" =~ $TAG_RE_DEFAULT_SEMVER ]] && matched=1
+    [[ "$tag" =~ $TAG_RE_DEFAULT_SHA ]] && matched=1
   fi
+  (( matched )) || die "Invalid tag format: '$tag'"
 }
 
 # ─────────────────────────────────────────────────────────────
-# GHCR API (private image — Basic Auth with a PAT)
+# GHCR API (private images — Basic Auth with a PAT)
 # ─────────────────────────────────────────────────────────────
 
 ghcr_basic_creds() {
@@ -198,23 +316,30 @@ ghcr_tag_exists() {
 
 # ─────────────────────────────────────────────────────────────
 # State + .env + log helpers
+#
+# State is keyed "<stack>/<component>" — components version in lockstep, so
+# one current/prior pair per component covers all its images.
 # ─────────────────────────────────────────────────────────────
 
+state_key() { printf '%s/%s' "$STACK" "$1"; }
+
 state_get() {
-  local field="${1:-}"
+  local comp="$1" field="${2:-}" key
+  key=$(state_key "$comp")
   if [[ -z "$field" ]]; then
-    jq -r --arg r "$IMAGE_REPO" '.[$r] // {} | tojson' "$STATE_FILE"
+    jq -r --arg r "$key" '.[$r] // {} | tojson' "$STATE_FILE"
   else
-    jq -r --arg r "$IMAGE_REPO" --arg f "$field" '.[$r][$f] // ""' "$STATE_FILE"
+    jq -r --arg r "$key" --arg f "$field" '.[$r][$f] // ""' "$STATE_FILE"
   fi
 }
 
 state_set() {
-  local new_tag="$1" now tmp prior_tag
+  local comp="$1" new_tag="$2" now tmp prior_tag key
+  key=$(state_key "$comp")
   now=$(date -u +'%Y-%m-%dT%H:%M:%SZ')
-  prior_tag=$(state_get current)
+  prior_tag=$(state_get "$comp" current)
   tmp=$(mktemp)
-  jq --arg r "$IMAGE_REPO" --arg cur "$new_tag" --arg prior "$prior_tag" --arg ts "$now" \
+  jq --arg r "$key" --arg cur "$new_tag" --arg prior "$prior_tag" --arg ts "$now" \
     '.[$r] = {current: $cur, prior: $prior, deployedAt: $ts}' \
     "$STATE_FILE" > "$tmp"
   mv "$tmp" "$STATE_FILE"
@@ -222,42 +347,52 @@ state_set() {
 }
 
 env_get() {
-  local key="$1"
-  if grep -qE "^${key}=" "$ENV_FILE" 2>/dev/null; then
-    grep -E "^${key}=" "$ENV_FILE" | head -1 | cut -d= -f2-
+  local comp="$1" key="$2" ef
+  ef=$(comp_env_file "$comp")
+  if grep -qE "^${key}=" "$ef" 2>/dev/null; then
+    grep -E "^${key}=" "$ef" | head -1 | cut -d= -f2-
   fi
 }
 
 env_set() {
-  local key="$1" val="$2" tmp
+  local comp="$1" key="$2" val="$3" tmp ef
+  ef=$(comp_env_file "$comp")
   tmp=$(mktemp)
-  if grep -qE "^${key}=" "$ENV_FILE"; then
+  if grep -qE "^${key}=" "$ef"; then
     awk -v k="$key" -v v="$val" '
       BEGIN { FS=OFS="=" }
       $1==k { print k "=" v; next }
       { print }
-    ' "$ENV_FILE" > "$tmp"
+    ' "$ef" > "$tmp"
   else
-    cp "$ENV_FILE" "$tmp"
+    cp "$ef" "$tmp"
     printf '%s=%s\n' "$key" "$val" >> "$tmp"
   fi
-  mv "$tmp" "$ENV_FILE"
+  mv "$tmp" "$ef"
 }
 
-# Effective health timeout: .env override > shell env > default. Validated to a
-# positive int so a typo can't make the wait loop exit immediately.
+# Pin every tag var the component's services declare to the same tag.
+pin_component() {
+  local comp="$1" tag="$2" rec tag_var
+  while IFS='|' read -r _ _ tag_var _ _ _; do
+    env_set "$comp" "$tag_var" "$tag"
+  done < <(comp_services "$comp")
+}
+
+# Effective health timeout: component .env override > shell env > default.
+# Validated to a positive int so a typo can't make the wait loop exit early.
 health_timeout() {
-  local v
-  v=$(env_get HEALTHCHECK_TIMEOUT_SECS)
+  local comp="$1" v
+  v=$(env_get "$comp" HEALTHCHECK_TIMEOUT_SECS)
   v="${v:-${HEALTHCHECK_TIMEOUT_SECS:-$HEALTHCHECK_TIMEOUT_DEFAULT}}"
   [[ "$v" =~ ^[1-9][0-9]*$ ]] || v="$HEALTHCHECK_TIMEOUT_DEFAULT"
   printf '%s' "$v"
 }
 
 log_event() {
-  local from="$1" to="$2" outcome="$3" ts
+  local comp="$1" from="$2" to="$3" outcome="$4" ts
   ts=$(date -u +'%Y-%m-%dT%H:%M:%SZ')
-  printf '%s %s %s -> %s %s\n' "$ts" "$COMPOSE_SERVICE" "${from:-<none>}" "$to" "$outcome" >> "$LOG_FILE"
+  printf '%s %s %s -> %s %s\n' "$ts" "$(state_key "$comp")" "${from:-<none>}" "$to" "$outcome" >> "$LOG_FILE"
 }
 
 # ─────────────────────────────────────────────────────────────
@@ -265,26 +400,41 @@ log_event() {
 # ─────────────────────────────────────────────────────────────
 
 compose() {
-  docker compose --env-file "$ENV_FILE" -f "$COMPOSE_WEB" "$@"
+  local comp="$1"; shift
+  docker compose --env-file "$(comp_env_file "$comp")" -f "$(comp_compose_file "$comp")" "$@"
 }
 
-# Wait for the host-PUBLISHED port to answer 200. This verifies what host nginx
-# actually proxies to — not merely the container's internal healthcheck. A
-# container can report "healthy" on its internal port while the published port
-# maps to the wrong container port (the 8080-vs-80 mismatch that 502'd the
-# live site). Returns 0 healthy, 1 timeout.
-wait_healthy() {
-  local elapsed=0 timeout port
-  timeout=$(health_timeout)
-  port=$(env_get UI_PORT || true); port="${port:-4203}"
-  while (( elapsed < timeout )); do
-    if curl -fsS --max-time 3 "http://127.0.0.1:${port}${HEALTH_PATH}" >/dev/null 2>&1; then
+# Wait for one service's host-PUBLISHED port to answer 200. This verifies
+# what host nginx actually proxies to — not merely the container's internal
+# healthcheck. A container can report "healthy" internally while the
+# published port maps to the wrong container port. Returns 0 healthy,
+# 1 timeout. Consumes from the shared deadline so a component's services
+# share one timeout budget.
+wait_healthy_service() {
+  local comp="$1" port_var="$2" port_default="$3" path="$4" deadline="$5"
+  local port
+  port=$(env_get "$comp" "$port_var" || true); port="${port:-$port_default}"
+  [[ -n "$port" ]] || return 0   # no health config — nothing to gate on
+  while (( $(date +%s) < deadline )); do
+    if curl -fsS --max-time 3 "http://127.0.0.1:${port}${path}" >/dev/null 2>&1; then
       return 0
     fi
     sleep "$HEALTHCHECK_POLL_INTERVAL"
-    elapsed=$(( elapsed + HEALTHCHECK_POLL_INTERVAL ))
   done
   return 1
+}
+
+wait_healthy_component() {
+  local comp="$1" deadline name port_var port_default path
+  deadline=$(( $(date +%s) + $(health_timeout "$comp") ))
+  while IFS='|' read -r name _ _ port_var port_default path; do
+    if wait_healthy_service "$comp" "$port_var" "$port_default" "$path" "$deadline"; then
+      ok "$name healthy on the published port"
+    else
+      err "$name did not answer on the published port"
+      return 1
+    fi
+  done < <(comp_services "$comp")
 }
 
 # ─────────────────────────────────────────────────────────────
@@ -292,45 +442,61 @@ wait_healthy() {
 # ─────────────────────────────────────────────────────────────
 
 cmd_list() {
-  local mode="${1:-versions}"   # versions (semver) | builds (main-<sha>)
-  printf '\n%sAvailable tags%s (mode=%s)\n\n' "${C_BOLD}" "${C_RESET}" "$mode"
-  printf '%s%s%s\n' "${C_CYAN}" "$IMAGE_REPO" "${C_RESET}"
-  local tags pattern matched
-  tags=$(ghcr_list_tags "$IMAGE_REPO" 2>/dev/null || true)
-  if [[ -z "$tags" ]]; then
-    printf '  %s(no tags found or image not yet published)%s\n\n' "${C_DIM}" "${C_RESET}"
-    return 0
-  fi
-  case "$mode" in
-    versions) pattern='^[0-9]+\.[0-9]+\.[0-9]+$'; matched=$(printf '%s\n' "$tags" | grep -E "$pattern" | sort -Vr | head -10) ;;
-    builds)   pattern='^main-[a-f0-9]+$';          matched=$(printf '%s\n' "$tags" | grep -E "$pattern" | sort -r  | head -10) ;;
-    *)        matched=$tags ;;
-  esac
-  if [[ -z "$matched" ]]; then
-    printf '  %s(no tags matching %s)%s\n' "${C_DIM}" "$pattern" "${C_RESET}"
-  else
-    printf '%s\n' "$matched" | sed 's/^/  /'
-  fi
+  local mode="${1:-versions}"   # versions (release tags) | builds (main-/sha-<sha>)
+  printf '\n%sAvailable tags%s (stack=%s, mode=%s)\n\n' "${C_BOLD}" "${C_RESET}" "$STACK" "$mode"
+  local comp rec image seen=" "
+  while IFS= read -r comp; do
+    while IFS='|' read -r _ image _ _ _ _; do
+      [[ "$seen" == *" $image "* ]] && continue
+      seen="${seen}${image} "
+      printf '%s%s%s\n' "${C_CYAN}" "$image" "${C_RESET}"
+      local tags pattern matched
+      tags=$(ghcr_list_tags "$image" 2>/dev/null || true)
+      if [[ -z "$tags" ]]; then
+        printf '  %s(no tags found or image not yet published)%s\n' "${C_DIM}" "${C_RESET}"
+        continue
+      fi
+      case "$mode" in
+        versions) pattern='^v?[0-9]+\.[0-9]+\.[0-9]+$'; matched=$(printf '%s\n' "$tags" | grep -E "$pattern" | sort -Vr | head -10) ;;
+        builds)   pattern='^(main|sha)-[a-f0-9]+$';     matched=$(printf '%s\n' "$tags" | grep -E "$pattern" | sort -r  | head -10) ;;
+        *)        matched=$tags ;;
+      esac
+      if [[ -z "$matched" ]]; then
+        printf '  %s(no tags matching %s)%s\n' "${C_DIM}" "$pattern" "${C_RESET}"
+      else
+        printf '%s\n' "$matched" | sed 's/^/  /'
+      fi
+    done < <(comp_services "$comp")
+  done < <(manifest_components)
   printf '\n'
 }
 
 cmd_status() {
-  printf '\n%sDeploy status%s\n\n' "${C_BOLD}" "${C_RESET}"
-  local cur prior deployedAt cid health_status
-  cur=$(state_get current)
-  prior=$(state_get prior)
-  deployedAt=$(state_get deployedAt)
-  cid=$(compose ps -q "$COMPOSE_SERVICE" 2>/dev/null || true)
-  if [[ -n "$cid" ]]; then
-    health_status=$(docker inspect --format '{{if .State.Health}}{{.State.Health.Status}}{{else}}{{if .State.Running}}running{{else}}stopped{{end}}{{end}}' "$cid" 2>/dev/null || echo unknown)
-  else
-    health_status="not-running"
-  fi
-  printf '%s%s%s\n' "${C_CYAN}" "$COMPOSE_SERVICE" "${C_RESET}"
-  printf '  current:    %s\n' "${cur:-<none>}"
-  printf '  prior:      %s\n' "${prior:-<none>}"
-  printf '  deployedAt: %s\n' "${deployedAt:-<none>}"
-  printf '  container:  %s\n\n' "$health_status"
+  printf '\n%sDeploy status%s (stack=%s)\n\n' "${C_BOLD}" "${C_RESET}" "$STACK"
+  local comp cur prior deployedAt name cid health_status
+  while IFS= read -r comp; do
+    if ! comp_managed "$comp"; then
+      printf '%s%s%s  %s(not set up on this box)%s\n\n' "${C_CYAN}" "$comp" "${C_RESET}" "${C_DIM}" "${C_RESET}"
+      continue
+    fi
+    cur=$(state_get "$comp" current)
+    prior=$(state_get "$comp" prior)
+    deployedAt=$(state_get "$comp" deployedAt)
+    printf '%s%s%s\n' "${C_CYAN}" "$comp" "${C_RESET}"
+    printf '  current:    %s\n' "${cur:-<none>}"
+    printf '  prior:      %s\n' "${prior:-<none>}"
+    printf '  deployedAt: %s\n' "${deployedAt:-<none>}"
+    while IFS='|' read -r name _ _ _ _ _; do
+      cid=$(compose "$comp" ps -q "$name" 2>/dev/null || true)
+      if [[ -n "$cid" ]]; then
+        health_status=$(docker inspect --format '{{if .State.Health}}{{.State.Health.Status}}{{else}}{{if .State.Running}}running{{else}}stopped{{end}}{{end}}' "$cid" 2>/dev/null || echo unknown)
+      else
+        health_status="not-running"
+      fi
+      printf '  %-24s %s\n' "$name:" "$health_status"
+    done < <(comp_services "$comp")
+    printf '\n'
+  done < <(manifest_components)
 }
 
 cmd_logs() {
@@ -339,51 +505,63 @@ cmd_logs() {
 }
 
 cmd_up() {
-  preflight
-  local tag
-  tag=$(env_get "$IMAGE_ENVVAR" || true)
-  if [[ -z "$tag" || "$tag" == "latest" ]]; then
-    die "$IMAGE_ENVVAR is '${tag:-unset}' — pin an immutable tag first (aw-deploy <X.Y.Z|main-sha>)"
-  fi
-  step "Bringing up $COMPOSE_SERVICE on pinned $tag"
-  compose up -d --force-recreate "$COMPOSE_SERVICE"
-  step "Waiting for healthy ($(health_timeout) s max)"
-  if wait_healthy; then
-    ok "Service healthy on the published port"
-    state_set "$tag"
+  local comp="$1" tag_var tag first_tag=""
+  preflight_component "$comp"
+  while IFS='|' read -r _ _ tag_var _ _ _; do
+    tag=$(env_get "$comp" "$tag_var" || true)
+    if [[ -z "$tag" || "$tag" == "latest" ]]; then
+      die "$tag_var is '${tag:-unset}' — pin an immutable tag first (aw-deploy $comp <tag>)"
+    fi
+    first_tag="${first_tag:-$tag}"
+  done < <(comp_services "$comp")
+  step "Bringing up $comp on pinned $first_tag"
+  # shellcheck disable=SC2046
+  compose "$comp" up -d --force-recreate $(comp_service_names "$comp" | tr '\n' ' ')
+  step "Waiting for healthy ($(health_timeout "$comp") s max)"
+  if wait_healthy_component "$comp"; then
+    state_set "$comp" "$first_tag"
   else
-    err "Published port did not answer — check 'aw-deploy --status' and host nginx"
+    err "Health gate failed — check 'aw-deploy --status' and host nginx"
     return 1
   fi
 }
 
 cmd_compose() {
-  preflight
-  [[ $# -gt 0 ]] || die "aw-deploy compose <args> — e.g. 'compose ps', 'compose logs -f armory-works-ui'"
-  compose "$@"
+  [[ $# -gt 0 ]] || die "aw-deploy compose [<component>] <args> — e.g. 'compose nom ps'"
+  local comp
+  if comp_exists "$1" 2>/dev/null; then
+    comp="$1"; shift
+    comp_managed "$comp" || die "Component '$comp' is not set up on this box"
+  else
+    comp=$(resolve_component "")
+  fi
+  [[ $# -gt 0 ]] || die "aw-deploy compose $comp <args> — e.g. 'compose $comp ps'"
+  preflight_component "$comp"
+  compose "$comp" "$@"
 }
 
 cmd_self_update() {
-  step "Self-update: $REPO_ROOT"
-  [[ -d "${REPO_ROOT}/.git" ]] || die "Not a git checkout: $REPO_ROOT"
-  if ! git -C "$REPO_ROOT" diff --quiet HEAD -- 2>/dev/null; then
-    die "Local changes to tracked files present in $REPO_ROOT — refusing to pull"
+  step "Self-update: $TOOL_HOME"
+  [[ -d "${TOOL_HOME}/.git" ]] || die "Not a git checkout: $TOOL_HOME"
+  if ! git -C "$TOOL_HOME" diff --quiet HEAD -- 2>/dev/null; then
+    die "Local changes to tracked files present in $TOOL_HOME — refusing to pull"
   fi
-  git -C "$REPO_ROOT" pull --ff-only
+  git -C "$TOOL_HOME" pull --ff-only
   ok "Pulled latest"
-  if [[ -x "${REPO_ROOT}/scripts/install-aw-deploy.sh" ]]; then
-    sudo "${REPO_ROOT}/scripts/install-aw-deploy.sh" --skip-auth
+  if [[ -x "${TOOL_HOME}/scripts/install-aw-deploy.sh" ]]; then
+    sudo "${TOOL_HOME}/scripts/install-aw-deploy.sh" --skip-auth
   else
     warn "install-aw-deploy.sh not found or not executable"
   fi
 }
 
 pick_tag_interactive() {
-  local tags
-  tags=$(ghcr_list_tags "$IMAGE_REPO" 2>/dev/null | grep -E '^[0-9]+\.[0-9]+\.[0-9]+$' | sort -Vr | head -5 || true)
-  [[ -z "$tags" ]] && tags=$(ghcr_list_tags "$IMAGE_REPO" 2>/dev/null | grep -E '^main-[a-f0-9]+$' | sort -r | head -5 || true)
-  [[ -z "$tags" ]] && die "No version or main-<sha> tags available for $IMAGE_REPO"
-  printf '\nRecent versions for %s:\n' "$IMAGE_REPO" >&2
+  local comp="$1" image tags
+  image=$(comp_services "$comp" | head -1 | cut -d'|' -f2)
+  tags=$(ghcr_list_tags "$image" 2>/dev/null | grep -E '^v?[0-9]+\.[0-9]+\.[0-9]+$' | sort -Vr | head -5 || true)
+  [[ -z "$tags" ]] && tags=$(ghcr_list_tags "$image" 2>/dev/null | grep -E '^(main|sha)-[a-f0-9]+$' | sort -r | head -5 || true)
+  [[ -z "$tags" ]] && die "No release or build tags available for $image"
+  printf '\nRecent versions for %s (%s):\n' "$comp" "$image" >&2
   local i=1 tag_array=()
   while IFS= read -r t; do
     [[ -z "$t" ]] && continue
@@ -402,62 +580,75 @@ pick_tag_interactive() {
 }
 
 deploy() {
-  local target_tag="$1" prior_tag
-  prior_tag=$(state_get current)
-  [[ -z "$prior_tag" ]] && prior_tag=$(env_get "$IMAGE_ENVVAR")
-
-  step "Deploying $COMPOSE_SERVICE -> $target_tag"
-
-  if ! ghcr_tag_exists "$IMAGE_REPO" "$target_tag"; then
-    err "Tag not found in GHCR: ${REGISTRY_OWNER}/${IMAGE_REPO}:${target_tag}"
-    log_event "$prior_tag" "$target_tag" "missing-in-ghcr"
-    return 1
+  local comp="$1" target_tag="$2" prior_tag rec name image svc_names
+  preflight_component "$comp"
+  prior_tag=$(state_get "$comp" current)
+  if [[ -z "$prior_tag" ]]; then
+    prior_tag=$(env_get "$comp" "$(comp_services "$comp" | head -1 | cut -d'|' -f3)" || true)
   fi
-  ok "Tag verified in GHCR"
+  svc_names=$(comp_service_names "$comp" | tr '\n' ' ')
 
-  env_set "$IMAGE_ENVVAR" "$target_tag"
-  ok ".env updated: ${IMAGE_ENVVAR}=${target_tag}"
+  step "Deploying ${STACK}/${comp} -> $target_tag"
 
-  if ! compose pull "$COMPOSE_SERVICE"; then
+  while IFS='|' read -r name image _ _ _ _; do
+    if ! ghcr_tag_exists "$image" "$target_tag"; then
+      err "Tag not found in GHCR: ${REGISTRY_OWNER}/${image}:${target_tag}"
+      log_event "$comp" "$prior_tag" "$target_tag" "missing-in-ghcr"
+      return 1
+    fi
+  done < <(comp_services "$comp")
+  ok "Tag verified in GHCR for every image"
+
+  pin_component "$comp" "$target_tag"
+  ok ".env pinned to ${target_tag}"
+
+  # shellcheck disable=SC2086
+  if ! compose "$comp" pull $svc_names; then
     err "docker compose pull failed"
-    env_set "$IMAGE_ENVVAR" "$prior_tag"
-    log_event "$prior_tag" "$target_tag" "pull-failed"
+    [[ -n "$prior_tag" ]] && pin_component "$comp" "$prior_tag"
+    log_event "$comp" "$prior_tag" "$target_tag" "pull-failed"
     return 1
   fi
-  ok "Image pulled"
+  ok "Images pulled"
 
-  if ! compose up -d --force-recreate "$COMPOSE_SERVICE"; then
+  # Recreate ONLY the manifest-listed services — sidecars (databases, etc.)
+  # in the same compose file are never touched by a deploy.
+  # shellcheck disable=SC2086
+  if ! compose "$comp" up -d --force-recreate $svc_names; then
     err "docker compose up -d failed — rolling back"
-    env_set "$IMAGE_ENVVAR" "$prior_tag"
-    compose up -d --force-recreate "$COMPOSE_SERVICE" || true
-    log_event "$prior_tag" "$target_tag" "up-failed"
+    if [[ -n "$prior_tag" ]]; then
+      pin_component "$comp" "$prior_tag"
+      # shellcheck disable=SC2086
+      compose "$comp" up -d --force-recreate $svc_names || true
+    fi
+    log_event "$comp" "$prior_tag" "$target_tag" "up-failed"
     return 1
   fi
-  ok "Container started"
+  ok "Containers started"
 
-  step "Waiting for healthy ($(health_timeout) s max)"
-  if wait_healthy; then
-    ok "Service healthy on the published port"
-    state_set "$target_tag"
-    log_event "$prior_tag" "$target_tag" "ok"
+  step "Waiting for healthy ($(health_timeout "$comp") s max)"
+  if wait_healthy_component "$comp"; then
+    state_set "$comp" "$target_tag"
+    log_event "$comp" "$prior_tag" "$target_tag" "ok"
     return 0
   fi
 
-  err "Published port did not answer — rolling back to ${prior_tag:-<none>}"
+  err "Health gate failed — rolling back to ${prior_tag:-<none>}"
   if [[ -n "$prior_tag" && "$prior_tag" != "$target_tag" ]]; then
-    env_set "$IMAGE_ENVVAR" "$prior_tag"
-    compose up -d --force-recreate "$COMPOSE_SERVICE" || true
+    pin_component "$comp" "$prior_tag"
+    # shellcheck disable=SC2086
+    compose "$comp" up -d --force-recreate $svc_names || true
   fi
-  log_event "$prior_tag" "$target_tag" "unhealthy-rolled-back"
+  log_event "$comp" "$prior_tag" "$target_tag" "unhealthy-rolled-back"
   return 1
 }
 
 cmd_rollback() {
-  local prior
-  prior=$(state_get prior)
-  [[ -n "$prior" ]] || die "No prior tag recorded — nothing to roll back to"
-  step "Rollback $COMPOSE_SERVICE -> $prior"
-  deploy "$prior"
+  local comp="$1" prior
+  prior=$(state_get "$comp" prior)
+  [[ -n "$prior" ]] || die "No prior tag recorded for ${STACK}/${comp} — nothing to roll back to"
+  step "Rollback ${STACK}/${comp} -> $prior"
+  deploy "$comp" "$prior"
 }
 
 # ─────────────────────────────────────────────────────────────
@@ -465,20 +656,33 @@ cmd_rollback() {
 # ─────────────────────────────────────────────────────────────
 
 main() {
-  # `compose` subcommand: pass everything after it to the scoped wrapper.
-  if [[ "${1:-}" == "compose" ]]; then
-    shift; cmd_compose "$@"; return
-  fi
+  local repo_flag="" mode="" list_mode="versions" positional=()
 
-  if [[ $# -eq 0 ]]; then
+  # First pass: pull out -r/--repo and the compose passthrough marker so the
+  # repo flag works in any position.
+  local args=() passthrough=()
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      -r|--repo)
+        [[ $# -ge 2 ]] || die "$1 needs a path argument"
+        repo_flag="$2"; shift 2 ;;
+      compose)
+        shift; passthrough=("$@"); args+=("compose"); break ;;
+      *) args+=("$1"); shift ;;
+    esac
+  done
+  set -- ${args[@]+"${args[@]}"}
+
+  REPO_ROOT="${repo_flag:-${AW_DEPLOY_REPO:-/opt/armoryworks-deploy}}"
+  REPO_ROOT="${REPO_ROOT%/}"
+  [[ -d "$REPO_ROOT" ]] || die "Deploy repo not found: $REPO_ROOT"
+
+  if [[ "${1:-}" == "compose" ]]; then
     preflight
-    local tag; tag=$(pick_tag_interactive)
-    validate_tag "$tag"
-    deploy "$tag" || { err "Deploy failed — check $LOG_FILE"; exit 1; }
+    cmd_compose ${passthrough[@]+"${passthrough[@]}"}
     return
   fi
 
-  local mode="" positional="" list_mode="versions"
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --help|-h)     usage; exit 0 ;;
@@ -492,23 +696,47 @@ main() {
       --up|--start)  mode="up"; shift ;;
       --self-update) mode="self-update"; shift ;;
       -*)            die "Unknown option: $1 (try --help)" ;;
-      *)
-        [[ -n "$positional" ]] && die "Unexpected extra argument: $1"
-        positional="$1"; shift ;;
+      *)             positional+=("$1"); shift ;;
     esac
   done
+  (( ${#positional[@]} <= 2 )) || die "Too many arguments (try --help)"
 
   case "$mode" in
-    list)        preflight; cmd_list "$list_mode" ;;
-    status)      preflight; cmd_status ;;
-    rollback)    preflight; cmd_rollback ;;
-    logs)        cmd_logs ;;
-    up)          cmd_up ;;
-    self-update) cmd_self_update ;;
+    list)
+      preflight; cmd_list "$list_mode" ;;
+    status)
+      preflight; cmd_status ;;
+    rollback)
+      preflight
+      cmd_rollback "$(resolve_component "${positional[0]:-}")" ;;
+    logs)
+      cmd_logs ;;
+    up)
+      preflight
+      cmd_up "$(resolve_component "${positional[0]:-}")" ;;
+    self-update)
+      cmd_self_update ;;
     "")
       preflight
-      validate_tag "$positional"
-      deploy "$positional" || { err "Deploy failed — check $LOG_FILE"; exit 1; }
+      local comp tag
+      case ${#positional[@]} in
+        0)
+          comp=$(resolve_component "")
+          tag=$(pick_tag_interactive "$comp") ;;
+        1)
+          if comp_exists "${positional[0]}" 2>/dev/null; then
+            comp=$(resolve_component "${positional[0]}")
+            tag=$(pick_tag_interactive "$comp")
+          else
+            comp=$(resolve_component "")
+            tag="${positional[0]}"
+          fi ;;
+        2)
+          comp=$(resolve_component "${positional[0]}")
+          tag="${positional[1]}" ;;
+      esac
+      validate_tag "$tag"
+      deploy "$comp" "$tag" || { err "Deploy failed — check $LOG_FILE"; exit 1; }
       ;;
     *) die "Internal error: unhandled mode '$mode'" ;;
   esac
